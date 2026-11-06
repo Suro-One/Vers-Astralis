@@ -82,6 +82,7 @@ import traceback
 import unicodedata
 import argparse
 import contextlib
+import codecs
 import http.server
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, asdict, field
@@ -167,6 +168,20 @@ def draw_round_rect(surface, color, rect, radius=8, width=0, aa_scale=_AA_SCALE)
     rect = pygame.Rect(rect)
     if rect.width <= 0 or rect.height <= 0:
         return
+    visible = rect.clip(surface.get_clip())
+    if visible.width <= 0 or visible.height <= 0:
+        return
+    if visible != rect:
+        temp = pygame.Surface((visible.width * aa_scale, visible.height * aa_scale), pygame.SRCALPHA)
+        shape = pygame.Rect((rect.x - visible.x) * aa_scale,
+                            (rect.y - visible.y) * aa_scale,
+                            rect.width * aa_scale, rect.height * aa_scale)
+        pygame.draw.rect(temp, color, shape,
+                         border_radius=int(radius * aa_scale),
+                         width=int(width * aa_scale))
+        temp = pygame.transform.smoothscale(temp, visible.size)
+        surface.blit(temp, visible.topleft)
+        return
     key = (rect.width, rect.height, radius, width, tuple(color) if len(color) in (3, 4) else color)
     temp = _AA_CACHE.get(key)
     if temp is None:
@@ -185,28 +200,38 @@ def draw_round_rect(surface, color, rect, radius=8, width=0, aa_scale=_AA_SCALE)
 def draw_round_rect_glow(surface, color, rect, radius=8, glow_alpha=40):
     """Subtle soft outer glow for focused/hovered elements -- smooths perceived edges further."""
     r = pygame.Rect(rect).inflate(6, 6)
-    glow = pygame.Surface((r.width * _AA_SCALE, r.height * _AA_SCALE), pygame.SRCALPHA)
+    visible = r.clip(surface.get_clip())
+    if visible.width <= 0 or visible.height <= 0:
+        return
+    scale = max(1, _AA_SCALE // 2)
+    glow = pygame.Surface((visible.width * scale, visible.height * scale), pygame.SRCALPHA)
+    shape = pygame.Rect((r.x - visible.x) * scale, (r.y - visible.y) * scale,
+                        r.width * scale, r.height * scale)
     c = (color[0], color[1], color[2], glow_alpha)
-    pygame.draw.rect(glow, c, glow.get_rect(), border_radius=int((radius + 3) * _AA_SCALE))
-    glow = pygame.transform.smoothscale(glow, (r.width, r.height))
-    surface.blit(glow, r.topleft)
+    pygame.draw.rect(glow, c, shape, border_radius=int((radius + 3) * scale))
+    glow = pygame.transform.smoothscale(glow, visible.size)
+    surface.blit(glow, visible.topleft)
 
 
 def draw_vertical_gradient(surface, rect, top, bottom, radius=0):
     rect = pygame.Rect(rect)
     if rect.width <= 0 or rect.height <= 0:
         return
-    layer = pygame.Surface(rect.size, pygame.SRCALPHA)
+    visible = rect.clip(surface.get_clip())
+    if visible.width <= 0 or visible.height <= 0:
+        return
+    layer = pygame.Surface(visible.size, pygame.SRCALPHA)
     ta, ba = (top[3] if len(top) > 3 else 255), (bottom[3] if len(bottom) > 3 else 255)
-    for y in range(rect.height):
-        q = y / max(1, rect.height - 1)
+    for y in range(visible.height):
+        q = (visible.y + y - rect.y) / max(1, rect.height - 1)
         rgb = tuple(int(top[i] * (1 - q) + bottom[i] * q) for i in range(3))
-        pygame.draw.line(layer, (*rgb, int(ta * (1 - q) + ba * q)), (0, y), (rect.width, y))
+        pygame.draw.line(layer, (*rgb, int(ta * (1 - q) + ba * q)), (0, y), (visible.width, y))
     if radius:
-        mask = pygame.Surface(rect.size, pygame.SRCALPHA)
-        pygame.draw.rect(mask, (255, 255, 255), mask.get_rect(), border_radius=radius)
+        mask = pygame.Surface(visible.size, pygame.SRCALPHA)
+        shape = pygame.Rect(rect.x - visible.x, rect.y - visible.y, rect.width, rect.height)
+        pygame.draw.rect(mask, (255, 255, 255), shape, border_radius=radius)
         layer.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
-    surface.blit(layer, rect.topleft)
+    surface.blit(layer, visible.topleft)
 
 
 # =====================================================================
@@ -243,11 +268,6 @@ def draw_glass_panel(surface, rect, radius=12, border_col=None, aurora=True):
     rect = pygame.Rect(rect)
     draw_round_rect_glow(surface, COLORS["purple"], rect, radius, glow_alpha=12)
     draw_round_rect(surface, COLORS["panel"], rect, radius)
-    if aurora and rect.width > 8 and rect.height > 8:
-        prev = surface.get_clip()
-        surface.set_clip(rect.inflate(-2, -2))
-        surface.blit(_aurora_surface((rect.width, rect.height), time.time()), rect.topleft)
-        surface.set_clip(prev)
     draw_vertical_gradient(surface, pygame.Rect(rect.x + 1, rect.y + 1, rect.width - 2,
                                                  min(34, rect.height - 2)),
                            (255, 255, 255, 24), (118, 140, 255, 0), max(1, radius - 1))
@@ -334,7 +354,6 @@ class OrbField:
 
     def draw(self, surface, size, t, dt=1/60.0):
         w, h = size
-        self._draw_background(surface, w, h)
         for b in self.balls:
             b.step(w, h, dt)
             b.draw(surface)
@@ -348,6 +367,8 @@ class WindowChrome:
         self.maximized = False
         self.buttons = {}
         self._hwnd = None
+        self._requested_opacity = 95
+        self._applied_opacity = None
         self.refresh_handle()
 
     def refresh_handle(self):
@@ -358,9 +379,23 @@ class WindowChrome:
                 user32 = ctypes.windll.user32
                 ex = user32.GetWindowLongW(self._hwnd, -20)
                 user32.SetWindowLongW(self._hwnd, -20, ex | 0x00080000)
-                user32.SetLayeredWindowAttributes(self._hwnd, 0, 242, 0x2)
+                self._applied_opacity = None
+                self.set_opacity(self._requested_opacity)
         except Exception:
             self._hwnd = None
+
+    def set_opacity(self, opacity):
+        self._requested_opacity = min(100, max(40, int(opacity)))
+        if (sys.platform != "win32" or not self._hwnd
+                or self._requested_opacity == self._applied_opacity):
+            return
+        try:
+            import ctypes
+            alpha = round(self._requested_opacity * 255 / 100)
+            ctypes.windll.user32.SetLayeredWindowAttributes(self._hwnd, 0, alpha, 0x2)
+            self._applied_opacity = self._requested_opacity
+        except Exception:
+            pass
 
     def _show(self, command):
         if sys.platform == "win32" and self._hwnd:
@@ -567,8 +602,8 @@ def _render_emoji_text(surf, pos, text, font, color, emoji_font=None):
             rendered = fnt.render(seg, True, color)
             surf.blit(rendered, (x + total_w, y))
             total_w += rendered.get_width()
-        except:
-            print("Zero width text output detected, skipping...")
+        except Exception:
+            pass
     return total_w
 
 
@@ -617,6 +652,11 @@ class TiktokenCodec:
                 except Exception:
                     continue  # drop invalid / unassigned token IDs
             return "".join(out)
+
+    def decode_bytes(self, ids) -> bytes:
+        if self.mode == "tiktoken" and self._enc is not None:
+            return self._enc.decode_bytes(ids)
+        return bytes([int(token) % 256 for token in ids])
 
 
 # --------------------------------------------------------------------
@@ -694,18 +734,21 @@ class GGUFUnigramCodec:
     TYPE_NORMAL, TYPE_UNKNOWN, TYPE_CONTROL = 1, 2, 3
     TYPE_USER, TYPE_UNUSED, TYPE_BYTE = 4, 5, 6
 
-    def __init__(self, tokens, scores, types, arch: str = ""):
+    def __init__(self, tokens, scores, types, arch: str = "", bos_id=None,
+                 eos_ids=None, unk_id=None, tokenizer_model: str = "rank_bpe"):
         self.tokens = [str(t) for t in tokens]
         self.scores = [float(s) for s in scores]
         self.types = [int(t) for t in types]
         self.arch = arch or ""
+        self.tokenizer_model = str(tokenizer_model or "rank_bpe").lower()
         self.encoding_name = f"gguf:{self.arch}" if self.arch else "gguf:unigram"
         self.mode = "gguf"
         self.vocab_size = len(self.tokens)
-        self.bos_id = self._find_special("<bos>")
-        self.unk_id = self._find_special("<unk>")
-        self.eos_ids = [i for i in (self._find_special("<eos>"),
-                                    self._find_special("<end_of_turn>")) if i is not None]
+        self.bos_id = bos_id if bos_id is not None else self._find_special("<bos>")
+        self.unk_id = unk_id if unk_id is not None else self._find_special("<unk>")
+        discovered_eos = [i for i in (self._find_special("<eos>"),
+                          self._find_special("<end_of_turn>")) if i is not None]
+        self.eos_ids = list(dict.fromkeys(discovered_eos + list(eos_ids or [])))
         # Merge table for llama.cpp-style score-ranked BPE. GGUF 'scores' for
         # bpe/"llama" vocabs are NOT unigram log-probs -- they are merge ranks
         # (0,-1,-2,...; higher = earlier merge; single chars sit at huge
@@ -714,6 +757,7 @@ class GGUFUnigramCodec:
         for i, (tok, ty) in enumerate(zip(self.tokens, self.types)):
             if ty == self.TYPE_NORMAL and tok:
                 self._norm[tok] = (self.scores[i], i)
+        self._max_token_chars = max((len(token) for token in self._norm), default=1)
         # literal specials recognised inside raw text (chat templates)
         self._specials = sorted(
             ((t, i) for i, (t, ty) in enumerate(zip(self.tokens, self.types))
@@ -763,8 +807,45 @@ class GGUFUnigramCodec:
             if first_plain and seg and not seg.startswith(_SPIECE_UNDERLINE):
                 seg = _SPIECE_UNDERLINE + seg   # sentencepiece dummy prefix
             first_plain = False
-            ids.extend(self._bpe(seg))
+            if self.tokenizer_model in ("gpt2", "byte_bpe", "byte-level-bpe"):
+                raise RuntimeError("GGUF byte-level BPE encoding is not source-compatible yet")
+            ids.extend(self._viterbi(seg) if self.tokenizer_model in
+                       ("llama", "spm", "unigram", "sentencepiece") else self._bpe(seg))
         return ids
+
+    def _viterbi(self, text: str):
+        length = len(text)
+        best = [float("-inf")] * (length + 1)
+        parents = [None] * (length + 1)
+        best[0] = 0.0
+        for start in range(length):
+            if best[start] == float("-inf"):
+                continue
+            stop = min(length, start + self._max_token_chars)
+            for end in range(start + 1, stop + 1):
+                entry = self._norm.get(text[start:end])
+                if entry is None:
+                    continue
+                score = best[start] + entry[0]
+                if score > best[end]:
+                    best[end] = score
+                    parents[end] = (start, [entry[1]])
+            if best[start + 1] == float("-inf"):
+                byte_ids = [self._byte_ids.get(byte) for byte in text[start].encode("utf-8")]
+                emitted = ([token_id for token_id in byte_ids if token_id is not None]
+                           if all(token_id is not None for token_id in byte_ids) else
+                           [self.unk_id if self.unk_id is not None else 0])
+                best[start + 1] = best[start] - 1000.0
+                parents[start + 1] = (start, emitted)
+
+        output, position = [], length
+        while position:
+            parent = parents[position]
+            if parent is None:
+                return [self.unk_id if self.unk_id is not None else 0]
+            position, token_ids = parent
+            output.append(token_ids)
+        return [token_id for segment in reversed(output) for token_id in segment]
 
     def _bpe(self, s: str):
         """Greedy best-pair merging over a linked list with a lazy max-heap:
@@ -843,11 +924,16 @@ class GGUFUnigramCodec:
     # ---- checkpoint portability ----
     def to_blob(self) -> dict:
         return {"tokens": self.tokens, "scores": self.scores,
-                "types": self.types, "arch": self.arch}
+                "types": self.types, "arch": self.arch,
+                "bos_id": self.bos_id, "eos_ids": self.eos_ids,
+                "unk_id": self.unk_id, "tokenizer_model": self.tokenizer_model}
 
     @classmethod
     def from_blob(cls, blob: dict) -> "GGUFUnigramCodec":
-        return cls(blob["tokens"], blob["scores"], blob["types"], arch=blob.get("arch", ""))
+        return cls(blob["tokens"], blob["scores"], blob["types"], arch=blob.get("arch", ""),
+                   bos_id=blob.get("bos_id"), eos_ids=blob.get("eos_ids"),
+                   unk_id=blob.get("unk_id"),
+                   tokenizer_model=blob.get("tokenizer_model", "rank_bpe"))
 
 
 def read_gguf_metadata(path: str, log=print) -> Tuple[Dict[str, Any], Optional[GGUFUnigramCodec]]:
@@ -868,12 +954,27 @@ def read_gguf_metadata(path: str, log=print) -> Tuple[Dict[str, Any], Optional[G
 
     arch = str(val("general.architecture", "") or "")
     meta: Dict[str, Any] = {"arch": arch, "name": str(val("general.name", "") or "")}
+    meta["tokenizer_model"] = str(val("tokenizer.ggml.model", "") or "").lower()
+    meta["tokenizer_pre"] = str(val("tokenizer.ggml.pre", "") or "").lower()
     meta["d_model"] = int(val(f"{arch}.embedding_length", 0) or 0)
     meta["n_layers"] = int(val(f"{arch}.block_count", 0) or 0)
     meta["n_heads"] = int(val(f"{arch}.attention.head_count", 0) or 0)
     meta["ff"] = int(val(f"{arch}.feed_forward_length", 0) or 0)
     meta["ctx"] = int(val(f"{arch}.context_length", 0) or 0)
     meta["rope_base"] = float(val(f"{arch}.rope.freq_base", 10000.0) or 10000.0)
+    meta["norm_eps"] = float(val(f"{arch}.attention.layer_norm_rms_epsilon",
+                                  val(f"{arch}.attention.layer_norm_epsilon", 1e-5)) or 1e-5)
+    meta["bos_id"] = val("tokenizer.ggml.bos_token_id")
+    meta["eos_id"] = val("tokenizer.ggml.eos_token_id")
+    meta["eot_id"] = val("tokenizer.ggml.eot_token_id")
+    meta["unk_id"] = val("tokenizer.ggml.unknown_token_id")
+    try:
+        meta["bos_id"] = int(meta["bos_id"]) if meta["bos_id"] is not None else None
+        meta["eos_ids"] = [int(value) for value in (meta["eos_id"], meta["eot_id"])
+                           if value is not None]
+        meta["unk_id"] = int(meta["unk_id"]) if meta["unk_id"] is not None else None
+    except (TypeError, ValueError):
+        meta["bos_id"], meta["eos_ids"], meta["unk_id"] = None, [], None
     meta["sliding_window"] = int(val(f"{arch}.attention.sliding_window", 0) or 0)
     meta["head_dim"] = int(val(f"{arch}.attention.key_length", 0) or 0)
     meta["n_kv_heads"] = int(val(f"{arch}.attention.head_count_kv", 0) or 0)
@@ -899,7 +1000,10 @@ def read_gguf_metadata(path: str, log=print) -> Tuple[Dict[str, Any], Optional[G
             ty_f = reader.fields.get(cand.replace("tokens", "token_type")) or reader.fields.get("tokenizer.ggml.token_type")
             scores = list(sc_f.contents()) if sc_f is not None else [0.0] * len(tokens)
             types = list(ty_f.contents()) if ty_f is not None else [1] * len(tokens)
-            codec = GGUFUnigramCodec(tokens, scores, types, arch=arch)
+            codec = GGUFUnigramCodec(tokens, scores, types, arch=arch,
+                                     bos_id=meta["bos_id"], eos_ids=meta["eos_ids"],
+                                     unk_id=meta["unk_id"],
+                                     tokenizer_model=meta["tokenizer_model"])
             log(f"[GGUF] tokenizer: {len(tokens):,} tokens (unigram, arch={arch or '?'}, field={cand})")
             break
         except Exception as e:
@@ -917,7 +1021,10 @@ def read_gguf_metadata(path: str, log=print) -> Tuple[Dict[str, Any], Optional[G
                     ty = reader.fields.get(name.replace(".tokens", ".token_type"))
                     scores = list(sc.contents()) if sc is not None else [0.0] * len(tokens)
                     types = list(ty.contents()) if ty is not None else [1] * len(tokens)
-                    codec = GGUFUnigramCodec(tokens, scores, types, arch=arch)
+                    codec = GGUFUnigramCodec(tokens, scores, types, arch=arch,
+                                             bos_id=meta["bos_id"], eos_ids=meta["eos_ids"],
+                                             unk_id=meta["unk_id"],
+                                             tokenizer_model=meta["tokenizer_model"])
                     log(f"[GGUF] tokenizer: {len(tokens):,} tokens (unigram, inferred field={name})")
                     break
                 except Exception:
@@ -1626,6 +1733,81 @@ class MetaScratchpad:
 # construction, and multi-turn context accumulation bypassed it entirely -- see
 # AuraLM.generate_stateful_turn below for the actual multi-turn fix).
 # =====================================================================
+def _append_kv_cache(cache, k_new, v_new, capacity):
+    k_new, v_new = k_new.detach(), v_new.detach()
+    batch, heads, length, head_dim = k_new.shape
+    if isinstance(cache, tuple) and len(cache) == 3:
+        k_store, v_store, total_seen = cache
+    else:
+        k_store = k_new.new_empty((batch, heads, 0, head_dim))
+        v_store = k_new.new_empty((batch, heads, 0, head_dim))
+        total_seen = 0
+        if isinstance(cache, tuple) and len(cache) == 2:
+            old_k, old_v = cache
+            copied = min(old_k.size(2), capacity)
+            if copied:
+                initial_capacity = min(capacity, max(16, copied))
+                k_store = k_new.new_empty((batch, heads, initial_capacity, head_dim))
+                v_store = v_new.new_empty((batch, heads, initial_capacity, head_dim))
+                k_store[:, :, :copied].copy_(old_k[:, :, -copied:])
+                v_store[:, :, :copied].copy_(old_v[:, :, -copied:])
+                total_seen = copied
+
+    current_capacity = k_store.size(2)
+    if total_seen + length > current_capacity and current_capacity < capacity:
+        new_capacity = min(capacity, max(16, current_capacity * 2, total_seen + length))
+        new_k = k_new.new_empty((batch, heads, new_capacity, head_dim))
+        new_v = v_new.new_empty((batch, heads, new_capacity, head_dim))
+        copied = min(total_seen, current_capacity)
+        if copied:
+            new_k[:, :, :copied].copy_(k_store[:, :, :copied])
+            new_v[:, :, :copied].copy_(v_store[:, :, :copied])
+        k_store, v_store = new_k, new_v
+        current_capacity = new_capacity
+
+    if total_seen + length <= current_capacity:
+        k_store[:, :, total_seen:total_seen + length].copy_(k_new)
+        v_store[:, :, total_seen:total_seen + length].copy_(v_new)
+    else:
+        for offset in range(length):
+            slot = (total_seen + offset) % current_capacity
+            k_store[:, :, slot:slot + 1].copy_(k_new[:, :, offset:offset + 1])
+            v_store[:, :, slot:slot + 1].copy_(v_new[:, :, offset:offset + 1])
+    total_seen += length
+    valid = min(total_seen, current_capacity)
+    if total_seen < current_capacity:
+        return k_store[:, :, :valid], v_store[:, :, :valid], (k_store, v_store, total_seen)
+    return k_store, v_store, (k_store, v_store, total_seen)
+
+
+def _scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False):
+    if not hasattr(F, "scaled_dot_product_attention"):
+        scale = 1.0 / math.sqrt(q.size(-1))
+        scores = (q @ k.transpose(-2, -1)) * scale
+        if is_causal:
+            mask = torch.ones(q.size(-2), k.size(-2), dtype=torch.bool,
+                              device=q.device).tril()
+            scores = scores.masked_fill(~mask.view(1, 1, *mask.shape), float("-inf"))
+        probabilities = F.softmax(scores, dim=-1)
+        if dropout_p:
+            probabilities = F.dropout(probabilities, p=dropout_p, training=True)
+        return probabilities @ v
+    if q.size(1) != k.size(1):
+        try:
+            return F.scaled_dot_product_attention(
+                q, k, v, dropout_p=dropout_p, is_causal=is_causal, enable_gqa=True)
+        except TypeError:
+            pass
+        except RuntimeError as error:
+            if "out of memory" in str(error).lower():
+                raise
+        repeat = q.size(1) // k.size(1)
+        k = k.repeat_interleave(repeat, dim=1)
+        v = v.repeat_interleave(repeat, dim=1)
+    return F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p,
+                                          is_causal=is_causal)
+
+
 class MultiHeadCausalAttention(nn.Module):
     """Fused-QKV causal attention with RoPE (rotary positional encoding).
     RoPE replaces the old learned absolute wpe table (fix C15 / item 6):
@@ -1723,15 +1905,12 @@ class MultiHeadCausalAttention(nn.Module):
         cos, sin = self._rope_cos_sin(pos, q.dtype)
         q = self._apply_rope(q, cos, sin)
         k = self._apply_rope(k, cos, sin)
-        k = self._expand_kv(k)
-        v = self._expand_kv(v)
-        y = F.scaled_dot_product_attention(
+        y = _scaled_dot_product_attention(
             q, k, v, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, self.inner)
         return self.resid_drop(self.c_proj(y))
 
-    def step(self, x_bd: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
-             pos_idx: int = 0):
+    def step(self, x_bd: torch.Tensor, kv_cache, pos_idx: int = 0):
         B, C = x_bd.shape
         q, k, v = self.c_attn(x_bd).split([self.inner, self.kv_inner, self.kv_inner], dim=1)
         q = q.view(B, self.n_heads, 1, self.head_dim)
@@ -1742,19 +1921,18 @@ class MultiHeadCausalAttention(nn.Module):
         cos, sin = self._rope_cos_sin(pos, q.dtype)
         q = self._apply_rope(q, cos, sin)
         k = self._apply_rope(k, cos, sin)
-        k_cache = torch.cat([k_cache, k], dim=2)
-        v_cache = torch.cat([v_cache, v], dim=2)
-        if k_cache.size(2) > self.max_seq:          # unconditional trim, every step
-            k_cache = k_cache[:, :, -self.max_seq:].contiguous()
-            v_cache = v_cache[:, :, -self.max_seq:].contiguous()
-        y = F.scaled_dot_product_attention(
-            q, self._expand_kv(k_cache), self._expand_kv(v_cache), is_causal=False)
+        k_cache, v_cache, new_cache = _append_kv_cache(kv_cache, k, v, self.max_seq)
+        y = _scaled_dot_product_attention(q, k_cache, v_cache, is_causal=False)
         y = y.transpose(1, 2).contiguous().view(B, self.inner)
-        return self.resid_drop(self.c_proj(y)), k_cache, v_cache
+        return self.resid_drop(self.c_proj(y)), new_cache
 
     def init_kv(self, batch_size, device, dtype):
-        z = lambda: torch.zeros(batch_size, self.n_kv_heads, 0, self.head_dim, device=device, dtype=dtype)
-        return z(), z()
+        shape = (batch_size, self.n_kv_heads, 0, self.head_dim)
+        return (torch.empty(shape, device=device, dtype=dtype),
+            torch.empty(shape, device=device, dtype=dtype), 0)
+
+    def prefill_kv(self, k, v):
+        return _append_kv_cache(None, k, v, self.max_seq)[2]
 
 
 # =====================================================================
@@ -1784,19 +1962,91 @@ def _causal_conv_step(conv: nn.Conv1d, x_bd: torch.Tensor, state: torch.Tensor):
     return out.squeeze(2), x_win[:, :, 1:]
 
 
+class DiagonalStateSpace(nn.Module):
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.in_proj = nn.Linear(d_model, d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        self.log_rate = nn.Parameter(torch.linspace(-2.0, -6.0, d_model))
+        self.skip = nn.Parameter(torch.ones(d_model))
+
+    def _decay(self, dtype, device):
+        return torch.exp(-F.softplus(self.log_rate.float())).to(device=device, dtype=dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, length, width = x.shape
+        if length == 0:
+            return x
+        u = self.in_proj(x).transpose(1, 2).float()
+        log_decay = -F.softplus(self.log_rate.float())
+        times = torch.arange(length, device=x.device, dtype=torch.float32)
+        kernel = torch.exp(log_decay[:, None] * times[None, :])
+        fft_length = 1 << (2 * length - 1).bit_length()
+        u_freq = torch.fft.rfft(u, n=fft_length, dim=-1)
+        k_freq = torch.fft.rfft(kernel, n=fft_length, dim=-1).unsqueeze(0)
+        state_sequence = torch.fft.irfft(u_freq * k_freq, n=fft_length, dim=-1)[..., :length]
+        projected = self.out_proj(state_sequence.transpose(1, 2).to(dtype=x.dtype))
+        return projected + x * self.skip
+
+    def final_state(self, x: torch.Tensor) -> torch.Tensor:
+        length = x.size(1)
+        if length == 0:
+            return x.new_zeros((x.size(0), x.size(2)))
+        u = self.in_proj(x).float()
+        log_decay = -F.softplus(self.log_rate.float())
+        powers = torch.arange(length - 1, -1, -1, device=x.device, dtype=torch.float32)
+        weights = torch.exp(log_decay[None, :] * powers[:, None])
+        return (u * weights.unsqueeze(0)).sum(dim=1).to(dtype=x.dtype)
+
+    def step(self, x: torch.Tensor, state: torch.Tensor):
+        if state is None:
+            state = self.init_state(x.size(0), x.device, x.dtype)
+        decay = self._decay(state.dtype, state.device)
+        new_state = state * decay + self.in_proj(x)
+        output = self.out_proj(new_state) + x * self.skip
+        return output, new_state
+
+    def init_state(self, batch_size: int, device, dtype):
+        return torch.zeros(batch_size, self.log_rate.numel(), device=device, dtype=dtype)
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, d_model: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(d_model))
+        self.eps = eps
+
+    def forward(self, x):
+        return F.rms_norm(x, (x.size(-1),), self.weight, self.eps)
+
+
+def _make_norm(d_model: int, norm_type: str, eps: float, bias: bool = True):
+    if norm_type == "rmsnorm":
+        return RMSNorm(d_model, eps)
+    return nn.LayerNorm(d_model, eps=eps, bias=bias)
+
+
 class GatedMLP(nn.Module):
     """GLU feed-forward matching llama/gemma exactly:
     down(gelu_tanh(gate(x)) * up(x)). Used for GGUF transplants so the source
     MLP matrices copy 1:1 -- the old up-only FFN silently dropped the gate
     projection's multiplicative path, which is half of the source MLP."""
-    def __init__(self, d_model: int, dff: int):
+    def __init__(self, d_model: int, dff: int, activation: str = "gelu_tanh"):
         super().__init__()
         self.gate_proj = nn.Linear(d_model, dff)
         self.up_proj = nn.Linear(d_model, dff)
         self.down_proj = nn.Linear(dff, d_model)
+        self.activation = activation
 
     def forward(self, x):
-        return self.down_proj(F.gelu(self.gate_proj(x), approximate="tanh") * self.up_proj(x))
+        gate = self.gate_proj(x)
+        if self.activation == "silu":
+            gate = F.silu(gate)
+        elif self.activation == "gelu":
+            gate = F.gelu(gate)
+        else:
+            gate = F.gelu(gate, approximate="tanh")
+        return self.down_proj(gate * self.up_proj(x))
 
 
 class HyenaBlock(nn.Module):
@@ -1804,7 +2054,8 @@ class HyenaBlock(nn.Module):
                  dropout: float = 0.1, n_heads: int = 4, use_attn: bool = True,
                  max_seq: int = 2048, use_rope: bool = True, rope_base: float = 10000.0,
                  gated_mlp: bool = False, attn_head_dim: int = 0,
-                 n_kv_heads: int = 0, qk_norm: bool = False):
+                 n_kv_heads: int = 0, qk_norm: bool = False,
+                 mlp_activation: str = "gelu_tanh"):
         super().__init__()
         if d_model < n_heads:
             n_heads = 1
@@ -1817,6 +2068,7 @@ class HyenaBlock(nn.Module):
         self.use_attn = use_attn
         self.norm1 = nn.LayerNorm(d_model)
         self.conv = nn.Conv1d(d_model, d_model, kernel_size=kernel_size, groups=n_heads, bias=True)
+        self.ssm = DiagonalStateSpace(d_model)
         self.attn = (MultiHeadCausalAttention(d_model, n_heads, dropout, max_seq,
                                               use_rope=use_rope, rope_base=rope_base,
                                               head_dim=attn_head_dim,
@@ -1826,13 +2078,13 @@ class HyenaBlock(nn.Module):
         nn.init.xavier_normal_(self.gate.weight, gain=0.1)
         self.norm2 = nn.LayerNorm(d_model)
         self.gated_mlp = gated_mlp
-        self.ffn = (GatedMLP(d_model, dim_feedforward) if gated_mlp else nn.Sequential(
+        self.ffn = (GatedMLP(d_model, dim_feedforward, mlp_activation) if gated_mlp else nn.Sequential(
             nn.Linear(d_model, dim_feedforward), nn.GELU(), nn.Linear(dim_feedforward, d_model)))
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.norm1(x)
-        combined = _causal_conv_full(self.conv, h)
+        combined = _causal_conv_full(self.conv, h) + self.ssm(h)
         if self.use_attn and self.attn is not None:
             combined = combined + self.attn(h)
         gate = torch.sigmoid(self.gate(combined))
@@ -1840,22 +2092,22 @@ class HyenaBlock(nn.Module):
         x = x + self.drop(self.ffn(self.norm2(x)))
         return x
 
-    def step(self, x, conv_state, kv_cache, pos_idx: int = 0):
+    def step(self, x, conv_state, kv_cache, pos_idx: int = 0, ssm_state=None):
         h = self.norm1(x)
         combined, new_conv_state = _causal_conv_step(self.conv, h, conv_state)
+        ssm_out, new_ssm_state = self.ssm.step(h, ssm_state)
+        combined = combined + ssm_out
         new_kv = None
         if self.use_attn and self.attn is not None:
             if kv_cache is None:
-                k_c, v_c = self.attn.init_kv(x.size(0), x.device, x.dtype)
-            else:
-                k_c, v_c = kv_cache
-            attn_out, k_c, v_c = self.attn.step(h, k_c, v_c, pos_idx)
+                kv_cache = self.attn.init_kv(x.size(0), x.device, x.dtype)
+            attn_out, kv_cache = self.attn.step(h, kv_cache, pos_idx)
             combined = combined + attn_out
-            new_kv = (k_c, v_c)
+            new_kv = kv_cache
         gate = torch.sigmoid(self.gate(combined))
         x = x + combined * gate
         x = x + self.ffn(self.norm2(x))
-        return x, new_conv_state, new_kv
+        return x, new_conv_state, new_kv, new_ssm_state
 
     def init_state(self, batch_size, device, dtype):
         return torch.zeros(batch_size, self.d_model, self.kernel_size - 1, device=device, dtype=dtype)
@@ -1887,11 +2139,6 @@ class GPTCausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(d_model, self.inner + 2 * self.kv_inner, bias=bias)
         self.c_proj = nn.Linear(self.inner, d_model, bias=bias)
         self.resid_dropout = nn.Dropout(dropout)
-        self.register_buffer(
-            "mask",
-            torch.tril(torch.ones(block_size, block_size))
-                  .view(1, 1, block_size, block_size)
-        )
         # RoPE support (optional)
         self.use_rope = use_rope
         self.rope_base = float(rope_base) if rope_base and rope_base > 0 else 10000.0
@@ -1939,7 +2186,7 @@ class GPTCausalSelfAttention(nn.Module):
             return t
         return t.repeat_interleave(self.n_head // self.n_kv_heads, dim=1)
 
-    def forward(self, x, past_kv=None, use_cache=False):
+    def forward(self, x, past_kv=None, use_cache=False, pos_offset=0):
         B, T, C = x.size()
         q, k, v = self.c_attn(x).split([self.inner, self.kv_inner, self.kv_inner], dim=2)
         nh, hs, nkv = self.n_head, self.head_dim, self.n_kv_heads
@@ -1952,49 +2199,30 @@ class GPTCausalSelfAttention(nn.Module):
 
         # RoPE
         if self.use_rope:
-            pos = torch.arange(T, device=x.device)
+            pos = torch.arange(pos_offset, pos_offset + T, device=x.device)
             cos, sin = self._rope_cos_sin(pos, q.dtype)
             if cos is not None:
                 q = self._apply_rope(q, cos, sin)
                 k = self._apply_rope(k, cos, sin)
 
-        # KV cache
-        if past_kv is not None:
-            k_cache, v_cache = past_kv
-            k = torch.cat([k_cache, k], dim=2)
-            v = torch.cat([v_cache, v], dim=2)
-            if k.size(2) > self.block_size:
-                k = k[:, :, -self.block_size:].contiguous()
-                v = v[:, :, -self.block_size:].contiguous()
-
-        # GQA broadcast for SDPA
-        k_exp = self._expand_kv(k)
-        v_exp = self._expand_kv(v)
-
-        if hasattr(F, "scaled_dot_product_attention"):
-            y = F.scaled_dot_product_attention(
-                q, k_exp, v_exp,
-                attn_mask=None,
-                dropout_p=self.dropout if self.training else 0.0,
-                is_causal=(past_kv is None),
-            )
+        if past_kv is not None or use_cache:
+            k, v, new_cache = _append_kv_cache(past_kv, k, v, self.block_size)
         else:
-            scale = 1.0 / math.sqrt(hs)
-            att = (q @ k_exp.transpose(-2, -1)) * scale
-            if past_kv is None:
-                att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
-            att = F.softmax(att, dim=-1)
-            y = att @ v_exp
+            new_cache = None
+        y = _scaled_dot_product_attention(
+            q, k, v, dropout_p=self.dropout if self.training else 0.0,
+            is_causal=(past_kv is None))
 
         y = y.transpose(1, 2).contiguous().view(B, T, self.inner)
 
         if use_cache:
-            return self.resid_dropout(self.c_proj(y)), (k.detach(), v.detach())
+            return self.resid_dropout(self.c_proj(y)), new_cache
         return self.resid_dropout(self.c_proj(y))
 
     def init_kv(self, batch_size, device, dtype):
-        z = lambda: torch.zeros(batch_size, self.n_kv_heads, 0, self.head_dim, device=device, dtype=dtype)
-        return z(), z()
+        shape = (batch_size, self.n_kv_heads, 0, self.head_dim)
+        return (torch.empty(shape, device=device, dtype=dtype),
+            torch.empty(shape, device=device, dtype=dtype), 0)
 
 
 class GPTMLP(nn.Module):
@@ -2017,20 +2245,23 @@ class GPTBlock(nn.Module):
                  block_size: int = 512, bias: bool = False, use_rope: bool = False,
                  rope_base: float = 10000.0, gated_mlp: bool = False,
                  dim_feedforward: int = None, head_dim: int = 0,
-                 n_kv_heads: int = 0, qk_norm: bool = False):
+                 n_kv_heads: int = 0, qk_norm: bool = False,
+                 norm_type: str = "layernorm", norm_eps: float = 1e-5,
+                 mlp_activation: str = "gelu_tanh"):
         super().__init__()
         self.d_model = d_model
         self.block_size = block_size
         self.n_heads = n_heads
         self.use_attn = True  # GPT always uses attention (keeps Hyena compat)
-        self.ln_1 = nn.LayerNorm(d_model, bias=bias)
+        self.ln_1 = _make_norm(d_model, norm_type, norm_eps, bias=bias)
         self.attn = GPTCausalSelfAttention(d_model, n_heads, dropout,
                                             block_size, bias, use_rope, rope_base,
                                             n_kv_heads=n_kv_heads,
                                             head_dim=head_dim, qk_norm=qk_norm)
-        self.ln_2 = nn.LayerNorm(d_model, bias=bias)
+        self.ln_2 = _make_norm(d_model, norm_type, norm_eps, bias=bias)
         dff = dim_feedforward or (d_model * 4)
-        self.mlp = (GatedMLP(d_model, dff) if gated_mlp else GPTMLP(d_model, dropout, bias))
+        self.mlp = (GatedMLP(d_model, dff, mlp_activation) if gated_mlp
+                else GPTMLP(d_model, dropout, bias))
 
     def forward(self, x):
         """Standard forward pass (prefill / training)."""
@@ -2055,7 +2286,8 @@ class GPTBlock(nn.Module):
         """Single-token forward with KV cache. Matches HyenaBlock.step signature."""
         x_2d = x.unsqueeze(1) if x.dim() == 2 else x
         h = self.ln_1(x_2d)
-        attn_out, new_kv = self.attn(h, past_kv=kv_cache, use_cache=True)
+        attn_out, new_kv = self.attn(h, past_kv=kv_cache, use_cache=True,
+                         pos_offset=pos_idx)
         x_2d = x_2d + attn_out
         x_2d = x_2d + self.mlp(self.ln_2(x_2d))
         out = x_2d.squeeze(1) if x.dim() == 2 else x_2d
@@ -2074,7 +2306,9 @@ class AuraCore(nn.Module):
                  dropout=0.1, n_heads=4, use_attn=True, max_seq=2048,
                  grad_checkpoint=False, use_rope=True, rope_bases=None,
                  gated_mlp=False, attn_head_dim=0, n_kv_heads=0, qk_norm=False,
-                 model_mode="gpt"):
+                 model_mode="gpt", attention_every_n_layers=4,
+                 norm_type="layernorm", norm_eps=1e-5,
+                 mlp_activation="gelu_tanh"):
         super().__init__()
         self.use_attn = use_attn
         self.grad_checkpoint = grad_checkpoint
@@ -2090,16 +2324,21 @@ class AuraCore(nn.Module):
                          use_rope=use_rope,
                          rope_base=rope_bases[i % len(rope_bases)] if rope_bases else 10000.0,
                          gated_mlp=gated_mlp, dim_feedforward=dim_feedforward,
-                         head_dim=attn_head_dim, n_kv_heads=n_kv_heads, qk_norm=qk_norm)
+                         head_dim=attn_head_dim, n_kv_heads=n_kv_heads, qk_norm=qk_norm,
+                         norm_type=norm_type, norm_eps=norm_eps,
+                         mlp_activation=mlp_activation)
                 for i in range(n_layers)
             ])
         else:
             # Hyena blocks with convolution + optional attention
             self.layers = nn.ModuleList([
-                HyenaBlock(d_model, kernel_size, dim_feedforward, dropout, n_heads, use_attn,
+                HyenaBlock(d_model, kernel_size, dim_feedforward, dropout, n_heads,
+                           use_attn and ((i + 1) % attention_every_n_layers == 0
+                                         or i == n_layers - 1),
                            max_seq, use_rope, rope_base=rope_bases[i % len(rope_bases)],
                            gated_mlp=gated_mlp, attn_head_dim=attn_head_dim,
-                           n_kv_heads=n_kv_heads, qk_norm=qk_norm)
+                           n_kv_heads=n_kv_heads, qk_norm=qk_norm,
+                           mlp_activation=mlp_activation)
                 for i in range(n_layers)
             ])
 
@@ -2153,19 +2392,24 @@ class AuraCore(nn.Module):
                     q_tmp = q_full.view(B, T, a.n_heads, a.head_dim).transpose(1, 2)
                     _, k_full = a._apply_qk_norm(q_tmp, k_full)
                 k_full = a.rotate_kv_for_cache(k_full)
-                if k_full.size(2) > a.max_seq:
-                    k_full = k_full[:, :, -a.max_seq:].contiguous()
-                    v_full = v_full[:, :, -a.max_seq:].contiguous()
-                kv = (k_full, v_full)
-            states.append((hist, kv))
+                kv = a.prefill_kv(k_full, v_full)
+            ssm_state = layer.ssm.final_state(h)
+            states.append((hist, kv, ssm_state))
             x = layer(x)
         return x, states
 
     def step(self, x, states: LayerStates, pos_idx: int = 0):
         new_states: LayerStates = []
-        for layer, (conv_s, kv) in zip(self.layers, states):
-            x, new_conv, new_kv = layer.step(x, conv_s, kv, pos_idx)
-            new_states.append((new_conv, new_kv))
+        for layer, layer_state in zip(self.layers, states):
+            if self.model_mode == "gpt":
+                conv_s, kv = layer_state
+                x, new_conv, new_kv = layer.step(x, conv_s, kv, pos_idx)
+                new_states.append((new_conv, new_kv))
+            else:
+                conv_s, kv, ssm_state = layer_state
+                x, new_conv, new_kv, new_ssm_state = layer.step(
+                    x, conv_s, kv, pos_idx, ssm_state)
+                new_states.append((new_conv, new_kv, new_ssm_state))
         return x, new_states
 
     def init_states(self, batch_size, device, dtype) -> LayerStates:
@@ -2178,7 +2422,8 @@ class AuraCore(nn.Module):
             for layer in self.layers:
                 conv_s = layer.init_state(batch_size, device, dtype)
                 kv = layer.attn.init_kv(batch_size, device, dtype) if (layer.use_attn and layer.attn) else None
-                out.append((conv_s, kv))
+                ssm_state = layer.ssm.init_state(batch_size, device, dtype)
+                out.append((conv_s, kv, ssm_state))
         return out
 
 
@@ -2194,7 +2439,9 @@ class AuraLM(nn.Module):
                  gated_mlp: bool = False, attn_head_dim: int = 0,
                  n_kv_heads: int = 0, qk_norm: bool = False,
                  ff_dim: int = 0, untie_head: bool = False,
-                 model_mode: str = "gpt"):
+                 model_mode: str = "gpt", attention_every_n_layers: int = 4,
+                 norm_type: str = "layernorm", norm_eps: float = 1e-5,
+                 mlp_activation: str = "gelu_tanh"):
         super().__init__()
         self.block_size = block_size
         self.vocab_size = vocab_size
@@ -2218,11 +2465,13 @@ class AuraLM(nn.Module):
                               n_heads, use_attn, block_size, grad_checkpoint, use_rope or False,
                               rope_bases=rope_bases, gated_mlp=gated_mlp,
                               attn_head_dim=attn_head_dim, n_kv_heads=n_kv_heads,
-                              qk_norm=qk_norm, model_mode=model_mode)
-        self.ln_f = nn.LayerNorm(d_model)
+                              qk_norm=qk_norm, model_mode=model_mode,
+                              attention_every_n_layers=attention_every_n_layers,
+                              norm_type=norm_type, norm_eps=norm_eps,
+                              mlp_activation=mlp_activation)
+        self.ln_f = _make_norm(d_model, norm_type, norm_eps)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
-        # Always weight tie for GPT mode (standard GPT practice)
-        if untie_head and model_mode != "gpt":
+        if untie_head:
             self.untie_head = True
         else:
             self.untie_head = False
@@ -2246,17 +2495,22 @@ class AuraLM(nn.Module):
     def count_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
+    def forward_hidden(self, idx):
+        _, T = idx.size()
+        T = min(T, self.block_size)
+        idx = idx[:, -T:]
+        if self.wpe is not None:
+            pos = torch.arange(T, device=idx.device).unsqueeze(0)
+            x = self.drop(self.wte(idx) + self.wpe(pos))
+        else:
+            x = self.drop(self.wte(idx))
+        return self.ln_f(self.core(x))
+
     def forward(self, idx, targets=None):
         B, T = idx.size()
         T = min(T, self.block_size)
         idx = idx[:, -T:]
-        if self.wpe is not None:       # legacy learned positions
-            pos = torch.arange(T, device=idx.device).unsqueeze(0)
-            x = self.drop(self.wte(idx) + self.wpe(pos))
-        else:
-            x = self.drop(self.wte(idx))   # positions handled by RoPE in attention
-        x = self.core(x)
-        x = self.ln_f(x)
+        x = self.forward_hidden(idx)
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
@@ -2276,7 +2530,7 @@ class AuraLM(nn.Module):
     @torch.inference_mode()   # PERF: faster than no_grad in the token loop
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=50,
                  stop_token_ids: Optional[List[int]] = None,
-                 finish_sentence: bool = False, finish_extra_tokens: int = 40,
+                 finish_sentence: bool = False, finish_extra_tokens: int = 128,
                  decode_fn=None, token_callback=None):
         """
         Hard-caps `idx_cond` to block_size BEFORE prefill and frees intermediate
@@ -2310,13 +2564,25 @@ class AuraLM(nn.Module):
 
         def sample(l2d):
             l = l2d / max(temperature, 1e-8)
-            l = self._top_k_filter(l, top_k)
-            if torch.isneginf(l).all():
-                l = torch.zeros_like(l)
-            p = F.softmax(l, dim=-1)
-            p = torch.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0).clamp(min=0)
-            p = p / p.sum(dim=-1, keepdim=True).clamp(min=1e-12)
-            return torch.multinomial(p, 1).clamp(0, vocab - 1)
+            all_negative_infinity = torch.isneginf(l).all(dim=-1, keepdim=True)
+            l = torch.where(all_negative_infinity, torch.zeros_like(l), l)
+            if top_k is not None and top_k > 0 and top_k < l.size(-1):
+                values, indices = torch.topk(l, top_k, dim=-1)
+                probabilities = F.softmax(values, dim=-1)
+                probabilities = torch.nan_to_num(probabilities, nan=0.0, posinf=0.0, neginf=0.0)
+                totals = probabilities.sum(dim=-1, keepdim=True)
+                probabilities = torch.where(
+                    totals > 0, probabilities / totals.clamp(min=1e-12),
+                    torch.full_like(probabilities, 1.0 / probabilities.size(-1)))
+                choice = torch.multinomial(probabilities, 1)
+                return indices.gather(-1, choice).clamp(0, vocab - 1)
+            probabilities = F.softmax(l, dim=-1)
+            probabilities = torch.nan_to_num(probabilities, nan=0.0, posinf=0.0, neginf=0.0).clamp(min=0)
+            totals = probabilities.sum(dim=-1, keepdim=True)
+            probabilities = torch.where(
+                totals > 0, probabilities / totals.clamp(min=1e-12),
+                torch.full_like(probabilities, 1.0 / probabilities.size(-1)))
+            return torch.multinomial(probabilities, 1).clamp(0, vocab - 1)
 
         next_tok = sample(logits_last)
         del logits_last
@@ -2324,9 +2590,22 @@ class AuraLM(nn.Module):
         pos_idx = T_p   # absolute RoPE position of the next token to be fed
 
         stream_text = ""
+        stream_token_ids = []
+        codec_owner = getattr(decode_fn, "__self__", None)
+        stream_decoder = (codecs.getincrementaldecoder("utf-8")("replace")
+                          if decode_fn is not None and hasattr(codec_owner, "decode_bytes")
+                          else None)
+
+        def decode_stream_token(token_id):
+            if stream_decoder is not None:
+                return stream_decoder.decode(codec_owner.decode_bytes([token_id]), final=False)
+            stream_token_ids.append(token_id)
+            return decode_fn(stream_token_ids)
+
         if decode_fn is not None:
             try:
-                stream_text = decode_fn([int(next_tok.item())])
+                first_token_id = int(next_tok.item())
+                stream_text = decode_stream_token(first_token_id)
             except Exception:
                 stream_text = ""
         if token_callback is not None and stream_text:
@@ -2338,7 +2617,9 @@ class AuraLM(nn.Module):
         total_budget = max_new_tokens + (max(0, finish_extra_tokens) if finish_sentence else 0)
         for step_i in range(total_budget - 1):
             tok = generated[-1]
-            if stop_token_ids and int(tok.item()) in stop_token_ids:
+            overtime_started = finish_sentence and len(generated) >= max_new_tokens
+            if (stop_token_ids and int(tok.item()) in stop_token_ids
+                    and not overtime_started):
                 break
             x_tok = self.wte(tok).squeeze(1)
             if self.wpe is not None:   # legacy learned positions saturate at block_size
@@ -2353,7 +2634,8 @@ class AuraLM(nn.Module):
 
             if decode_fn is not None:
                 try:
-                    stream_text += decode_fn([int(next_tok.item())])
+                    next_token_id = int(next_tok.item())
+                    stream_text += decode_stream_token(next_token_id)
                 except Exception:
                     pass
                 if token_callback is not None and (step_i % 2 == 0 or step_i >= total_budget - 2):
@@ -2367,6 +2649,16 @@ class AuraLM(nn.Module):
                     tail = stream_text.rstrip(" \t\n\"'`)]}")
                     if tail.endswith((".", "!", "?", "\u2026")):
                         break
+
+        if stream_decoder is not None:
+            tail = stream_decoder.decode(b"", final=True)
+            if tail:
+                stream_text += tail
+                if token_callback is not None:
+                    try:
+                        token_callback(stream_text)
+                    except Exception:
+                        pass
 
         out = torch.cat([idx, torch.cat(generated, dim=1)], dim=1)
         del states
@@ -2620,35 +2912,37 @@ _LEGACY_LOSS_NAMES = {"cross_entropy_default", "smart_loss_heuristics", "smart_l
 # =====================================================================
 @dataclass
 class Config:
-    d_model: int = 384
-    n_layers: int = 6
-    n_heads: int = 6
+    d_model: int = 512
+    n_layers: int = 8
+    n_heads: int = 8
+    override_n_heads_on_load: bool = False
     kernel_size: int = 4
     dropout: float = 0.1
     learning_rate: float = 3e-4
     min_lr: float = 3e-5
     warmup_epochs: int = 1
-    batch_size: int = 8
+    batch_size: int = 2
     grad_accumulation_steps: int = 1
     epochs: int = 10
-    seq_len: int = 256
+    seq_len: int = 2048
+    override_seq_len_on_load: bool = False
     encoding: str = "cl100k_base"
     memory_mode: str = "auto"
     training_file: str = "input.txt"
     checkpoint_dir: str = "checkpoints"
     cache_dir: str = ".cache"
     save_every: int = 1
-    train_dtype: str = "amp_bf16"
-    grad_checkpoint: bool = True
+    train_dtype: str = "amp_fp16"
+    grad_checkpoint: bool = False
     multi_gpu: bool = False
     ewc_lambda: float = 0.0
     ewc_samples: int = 16
-    send_only_recent: bool = True
+    send_only_recent: bool = False
     parse_markdown: bool = True
     use_transformer_attention: bool = True
-    gen_steps: int = 120
+    gen_steps: int = 256
     temperature: float = 0.8
-    top_k: int = 50
+    top_k: int = 64
     continue_file: str = ""
     continue_epochs: int = 5
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -2664,13 +2958,20 @@ class Config:
     # Character-level reward shaping: scale of extra reward for reconstructing
     # frequent words when using the `char` encoding (0.0 = disabled)
     char_reward_scale: float = 0.1
+    input_noise: float = 0.03
 
     # ---- v12 additions ----
     user_name: str = "Aria"                         # item 7: chat identity
     assistant_name: str = "Aura"
+    speaker_identity: str = ""                     # blank follows assistant_name
+    dataset_on_device: bool = True
+    progress_interval: int = 10
+    gui_fps: int = 60
+    gui_balls_enabled: bool = True
+    gui_window_opacity: int = 95
     system_prompt: str = ""                         # always prepended before the messages
     prefix_loss_weight: float = 2.0                 # extra CE weight on name-prefix tokens
-    finish_max_extra: int = 40                      # item 8: overtime token cap
+    finish_max_extra: int = 128                     # item 8: overtime token cap
     keep_checkpoints: int = 5                       # E2: rotate epoch checkpoints, keep last N
     pos_encoding: str = "rope"                      # rope (dynamic ctx) | learned (legacy wpe)
     rope_base: float = 10000.0                      # RoPE theta (llama=1e4, gemma global=1e6)
@@ -2682,10 +2983,14 @@ class Config:
     n_kv_heads: int = 0                             # 0 = n_heads (MHA); <n_heads = GQA
     qk_norm: bool = False                           # gemma per-head RMSNorm on q/k
     gated_mlp: bool = False                         # GLU MLP (llama/gemma) vs up-only FFN
+    norm_type: str = "layernorm"
+    norm_eps: float = 1e-5
+    mlp_activation: str = "gelu_tanh"
     untie_head: bool = False                        # separate lm_head from wte
 
     # ---- model mode: "gpt" (pure transformer) or "hyena" (hyena-hierarchy) ----
-    model_mode: str = "gpt"
+    model_mode: str = "hyena"
+    attention_every_n_layers: int = 4
 
     # ---- OpenAI-compatible API server (item 16) ----
     api_enabled: bool = False
@@ -2696,6 +3001,10 @@ class Config:
     def validate(self):
         if self.model_mode not in ("gpt", "hyena"):
             self.model_mode = "gpt"
+        try:
+            self.attention_every_n_layers = max(1, int(self.attention_every_n_layers))
+        except (TypeError, ValueError):
+            self.attention_every_n_layers = 4
         if self.n_heads < 1:
             self.n_heads = 1
         if self.d_model < self.n_heads:
@@ -2728,6 +3037,13 @@ class Config:
             self.user_name = "Aria"
         if not str(self.assistant_name).strip():
             self.assistant_name = "Aura"
+        self.speaker_identity = str(self.speaker_identity or "").strip()
+        if not self.speaker_identity:
+            self.speaker_identity = self.assistant_name
+        try:
+            self.progress_interval = max(1, int(self.progress_interval))
+        except (TypeError, ValueError):
+            self.progress_interval = 10
         if self.prefix_loss_weight < 1.0:
             self.prefix_loss_weight = 1.0
         if self.finish_max_extra < 0:
@@ -2761,6 +3077,21 @@ class Config:
                 setattr(self, _f, 0)
             if getattr(self, _f) < 0:
                 setattr(self, _f, 0)
+        if self.n_kv_heads and (self.n_kv_heads > self.n_heads
+                                or self.n_heads % self.n_kv_heads != 0):
+            self.n_kv_heads = max(
+                h for h in range(1, min(self.n_kv_heads, self.n_heads) + 1)
+                if self.n_heads % h == 0)
+        if self.norm_type not in ("layernorm", "rmsnorm"):
+            self.norm_type = "layernorm"
+        try:
+            self.norm_eps = float(self.norm_eps)
+        except Exception:
+            self.norm_eps = 1e-5
+        if self.norm_eps <= 0:
+            self.norm_eps = 1e-5
+        if self.mlp_activation not in ("gelu_tanh", "gelu", "silu"):
+            self.mlp_activation = "gelu_tanh"
         try:
             self.api_port = int(self.api_port)
         except Exception:
@@ -2771,6 +3102,18 @@ class Config:
             self.astralis_max_kb = 1
         if self.stop_loss < 0:
             self.stop_loss = 0.0
+        try:
+            self.gui_fps = min(240, max(15, int(self.gui_fps)))
+        except (TypeError, ValueError):
+            self.gui_fps = 60
+        try:
+            self.gui_window_opacity = min(100, max(40, int(self.gui_window_opacity)))
+        except (TypeError, ValueError):
+            self.gui_window_opacity = 95
+        try:
+            self.input_noise = min(0.25, max(0.0, float(self.input_noise)))
+        except (TypeError, ValueError):
+            self.input_noise = 0.03
 
 
 # Condensed, descriptive labels for the settings panel per request ("smart condensed
@@ -2779,18 +3122,21 @@ FIELD_LABELS = {
     "d_model": "d_model (hidden width)",
     "n_layers": "n_layers (depth)",
     "n_heads": "n_heads (attn/conv groups)",
+    "override_n_heads_on_load": "override checkpoint n_heads on load",
     "kernel_size": "conv kernel size",
     "use_transformer_attention": "enable attention (MHA)",
     "batch_size": "batch size",
     "grad_accumulation_steps": "grad accumulation steps",
     "epochs": "epochs (target)",
     "seq_len": "sequence length",
+    "override_seq_len_on_load": "override checkpoint seq_len on load",
     "warmup_epochs": "LR warmup epochs",
     "save_every": "checkpoint every N epochs",
     "keep_checkpoints": "keep last N epoch checkpoints",
     "train_dtype": "precision (dtype)",
     "grad_checkpoint": "gradient checkpointing (VRAM saver)",
     "model_mode": "model mode (gpt=transformer / hyena=hierarchy)",
+        "attention_every_n_layers": "attention every N hybrid layers",
     "pos_encoding": "positions (rope=dynamic / learned=legacy)",
     "rope_base": "rope theta (base freq)",
     "rope_global_every": "rope global every N layers (0=off)",
@@ -2800,6 +3146,9 @@ FIELD_LABELS = {
     "n_kv_heads": "kv heads (0 = n_heads, GQA)",
     "qk_norm": "gemma q/k RMSNorm",
     "gated_mlp": "gated (GLU) MLP",
+    "norm_type": "normalization",
+    "norm_eps": "normalization epsilon",
+    "mlp_activation": "gated MLP activation",
     "untie_head": "untied lm_head/embeddings",
     "multi_gpu": "multi-GPU",
     "encoding": "tokenizer encoding",
@@ -2809,6 +3158,7 @@ FIELD_LABELS = {
     "ewc_lambda": "EWC lambda (continual-fit)",
     "ewc_samples": "EWC fisher samples",
     "loss_fn": "loss function",
+        "input_noise": "input token noise (abstraction regularizer)",
     "stop_loss": "stop-loss target (0=off)",
     "gen_steps": "gen steps (max tokens)",
     "temperature": "temperature",
@@ -2819,8 +3169,14 @@ FIELD_LABELS = {
     "finish_max_extra": "finish-sentence overtime tokens",
     "user_name": "user name (chat prefix)",
     "assistant_name": "assistant name (chat prefix)",
+    "speaker_identity": "model speaking identity",
     "system_prompt": "system prompt (prepended)",
     "prefix_loss_weight": "name-prefix loss weight",
+    "dataset_on_device": "cache token dataset on GPU when it fits",
+    "progress_interval": "training UI update interval (steps)",
+    "gui_fps": "GUI frame-rate cap",
+    "gui_balls_enabled": "animate background balls",
+    "gui_window_opacity": "window opacity percent",
     "training_file": "training file path",
     "checkpoint_dir": "checkpoint directory",
     "cache_dir": "token cache directory",
@@ -2837,19 +3193,26 @@ FIELD_LABELS = {
 }
 
 FIELD_GROUPS = [
-    ("model", ["model_mode", "d_model", "n_layers", "n_heads", "kernel_size", "use_transformer_attention",
+    ("model", ["model_mode", "d_model", "n_layers", "n_heads", "override_n_heads_on_load",
+               "kernel_size", "use_transformer_attention",
+                           "attention_every_n_layers",
                "pos_encoding", "rope_base", "rope_global_every", "rope_global_base",
-               "ff_dim", "attn_head_dim", "n_kv_heads", "qk_norm", "gated_mlp", "untie_head"]),
+               "ff_dim", "attn_head_dim", "n_kv_heads", "qk_norm", "gated_mlp",
+               "norm_type", "norm_eps", "mlp_activation", "untie_head"]),
     ("training", ["batch_size", "grad_accumulation_steps", "epochs", "seq_len",
+                  "override_seq_len_on_load",
                   "warmup_epochs", "save_every", "keep_checkpoints", "train_dtype",
                   "grad_checkpoint", "multi_gpu", "encoding"]),
     ("optimizer / loss", ["learning_rate", "min_lr", "dropout", "ewc_lambda", "ewc_samples",
-                          "loss_fn", "stop_loss"]),
+                          "loss_fn", "input_noise", "stop_loss"]),
     # Item 15: gen_steps/temperature/top_k/send_only_recent/parse_markdown/
     # finish_sentence live ONLY in the controls above the chat + footer now --
     # the duplicated settings-panel copies were removed (they never synced).
     ("generation", ["finish_max_extra"]),
-    ("chat identity", ["user_name", "assistant_name", "prefix_loss_weight", "system_prompt"]),
+    ("chat identity", ["user_name", "assistant_name", "speaker_identity",
+                       "prefix_loss_weight", "system_prompt"]),
+    ("performance", ["dataset_on_device", "progress_interval", "gui_fps",
+                      "gui_balls_enabled", "gui_window_opacity"]),
     ("paths", ["training_file", "checkpoint_dir", "cache_dir"]),
     ("fine-tune", ["continue_file", "continue_epochs"]),
     ("meta-intelligence (experimental)", ["meta_generate", "astralis_max_kb",
@@ -2859,6 +3222,8 @@ FIELD_GROUPS = [
 
 TRAIN_DTYPE_OPTIONS = ["amp_bf16", "amp_fp16", "fp32", "bf16", "fp16", "q8", "q4"]
 ENCODING_OPTIONS = ["cl100k_base", "gpt2", "o200k_base", "char"]
+NORM_TYPE_OPTIONS = ["layernorm", "rmsnorm"]
+MLP_ACTIVATION_OPTIONS = ["gelu_tanh", "gelu", "silu"]
 SCRATCHPAD_OPTIONS = list(MetaScratchpad.MODES)
 MODEL_MODE_OPTIONS = ["gpt", "hyena"]
 
@@ -2891,35 +3256,48 @@ def save_config(mgr: SettingsManager, cfg: Config):
 def count_model_params(cfg: Config, vocab_size: int) -> Tuple[int, int]:
     """Returns (total_params, linear_params). Mirrors AuraLM construction exactly."""
     d, L, k, h = cfg.d_model, cfg.n_layers, cfg.kernel_size, max(1, cfg.n_heads)
-    dff = d * 4
-    embed = vocab_size * d                # wte tied with lm_head -> ONE tensor
-    pos = cfg.seq_len * d                 # GPT mode always has wpe; hyena uses learned when configured
-    if cfg.model_mode != "gpt" and getattr(cfg, "pos_encoding", "rope") != "learned":
-        pos = 0
+    dff = cfg.ff_dim or d * 4
+    head_dim = cfg.attn_head_dim or max(1, d // h)
+    kv_heads = cfg.n_kv_heads or h
+    inner, kv_inner = h * head_dim, kv_heads * head_dim
+    embed = vocab_size * d
+    pos = cfg.seq_len * d if cfg.pos_encoding != "rope" else 0
+    tied_head = not cfg.untie_head
+    head_params = 0 if tied_head else vocab_size * d
+    linear_params = head_params
+    other_params = embed + pos + (d if cfg.norm_type == "rmsnorm" else 2 * d)
     if cfg.model_mode == "gpt":
-        # GPT: no conv, no gate; uses full attention
-        per_layer_linear = 3 * d * d + d * d          # c_attn + c_proj (bias=False)
-        per_layer_linear += d * dff + dff + dff * d + d  # ffn up+down (bias=True)
-        norms = 2 * (2 * d)                            # norm1 + norm2 (w+b each)
-        per_layer = per_layer_linear + norms
+        attn = d * (inner + 2 * kv_inner) + inner * d
+        mlp = (3 * d * dff + 2 * dff + d if cfg.gated_mlp
+               else 2 * d * dff)
+        per_linear = attn + mlp
+        per_other = 2 * d + (2 * head_dim if cfg.qk_norm else 0)
+        linear_params += per_linear * L
+        other_params += (per_other + (0 if tied_head else 0)) * L
     else:
-        per_layer_linear = 0
-        if cfg.use_transformer_attention:
-            per_layer_linear += 3 * d * d + d * d      # c_attn + c_proj
-        per_layer_linear += d * d + d                  # gate (w+b)
-        per_layer_linear += d * dff + dff + dff * d + d  # ffn up+down
-        conv = d * (d // h) * k + d                    # grouped conv (w+b)
-        norms = 2 * (2 * d)                            # norm1 + norm2 (w+b each)
-        per_layer = per_layer_linear + conv + norms
-    total = embed + pos + per_layer * L + 2 * d        # + ln_f (w+b)
-    return int(total), int(per_layer_linear * L)
+        attn_layers = (sum(1 for i in range(L)
+                           if (i + 1) % max(1, cfg.attention_every_n_layers) == 0 or i == L - 1)
+                       if cfg.use_transformer_attention else 0)
+        attn = d * (inner + 2 * kv_inner) + inner * d
+        ssm = 2 * d * d
+        gate = d * d + d
+        mlp = (3 * d * dff + 2 * dff + d if cfg.gated_mlp
+               else 2 * d * dff + dff + d)
+        conv = d * (d // h) * k + d
+        per_linear = attn + ssm + gate + mlp
+        per_other = 4 * d + 2 * d + conv
+        linear_params += per_linear * attn_layers
+        linear_params += (ssm + gate + mlp) * L
+        other_params += per_other * L + (2 * head_dim * attn_layers if cfg.qk_norm else 0)
+    return int(linear_params + other_params), int(linear_params)
 
 
 def predict_vram_usage(cfg: Config, vocab_size: int) -> Dict[str, float]:
     """Predicted TRAINING VRAM (bytes), derived from the actual implementation:
     weights + grads + AdamW moments (per dtype policy), activations (respecting
-    gradient checkpointing), the logits + chunked-CE workspace, and CUDA context
-    overhead, with a +15% allocator/fragmentation margin ('low'..'high' band)."""
+    gradient checkpointing), and the logits workspace used by the configured
+    loss. Runtime CUDA context is not charged here because the GPU-fit guard
+    compares against currently-free memory, which already includes it."""
     total_params, linear_params = count_model_params(cfg, vocab_size)
     other_params = total_params - linear_params
     dt = cfg.train_dtype
@@ -2946,25 +3324,27 @@ def predict_vram_usage(cfg: Config, vocab_size: int) -> Dict[str, float]:
     d, L = cfg.d_model, cfg.n_layers
     B, T = max(1, cfg.batch_size), max(1, cfg.seq_len)
     if cfg.model_mode == "gpt":
-        # GPT: per-layer activations are attn_out(d) + mlp_hidden(4d) + residuals(2d) + ln(2d)
-        per_layer_act = 9 * d * act_bytes
+        per_layer_act = 12 * d * act_bytes
     else:
-        # Hyena: per-layer activations include conv + attn + gate + mlp + norms + residuals
-        per_layer_act = 24 * d * act_bytes
+        # Includes the SSM's fp32 FFT working set as well as block activations.
+        per_layer_act = 16 * d * act_bytes + 4 * d * 4
     if cfg.grad_checkpoint:
-        activations = B * T * (2 * d * act_bytes * L + per_layer_act)  # inputs + 1 live layer
+        activations = B * T * (d * act_bytes * L + per_layer_act)
     else:
         activations = B * T * per_layer_act * L
-    # logits fwd + logits grad + chunked-CE fp32 workspace (capped at chunk rows)
-    logits = B * T * vocab_size * act_bytes * 2 + 4096 * vocab_size * 4
-    context = 600 * 1024 * 1024              # CUDA context + cuBLAS/cuDNN workspaces
-    subtotal = weights + optim_grads + activations + logits + context
+    rows = B * T
+    if cfg.loss_fn == "anti_repetition":
+        logits = rows * vocab_size * (act_bytes + 4)
+    else:
+        logits = rows * vocab_size * 4 + min(512, rows) * vocab_size * 4
+    subtotal = weights + optim_grads + activations + logits
+    margin = max(64 * 1024 * 1024, subtotal * 0.05)
     return {
         "params": float(total_params),
         "weights": float(weights), "optimizer": float(optim_grads),
         "activations": float(activations), "logits": float(logits),
-        "context": float(context),
-        "total": float(subtotal * 1.15), "low": float(subtotal), "high": float(subtotal * 1.30),
+        "context": 0.0,
+        "total": float(subtotal + margin), "low": float(subtotal), "high": float(subtotal + 2 * margin),
     }
 
 
@@ -3000,29 +3380,30 @@ def predict_inference_vram_usage(cfg: Config, vocab_size: int) -> Dict[str, floa
     weights = linear_params * w_lin + other_params * w_oth
 
     d, L = cfg.d_model, cfg.n_layers
-    B, T = max(1, cfg.batch_size), max(1, cfg.seq_len)
-
-    # KV cache: store keys+values for each layer for autoregressive decoding
-    # approx: 2 * T * d * L * act_bytes
-    kv_cache = 2 * T * d * L * act_bytes
-
-    # Small live activation working set for a single forward step (conservative)
-    per_step_act = 4 * d * act_bytes * L
-    activations = B * per_step_act
-
-    # Logits workspace (single forward) - conservative upper bound
-    logits = B * T * vocab_size * act_bytes
-
-    context = 600 * 1024 * 1024
-    subtotal = weights + kv_cache + activations + logits + context
+    B, T = 1, max(1, cfg.seq_len)
+    n_kv = cfg.n_kv_heads or cfg.n_heads
+    head_dim = cfg.attn_head_dim or max(1, d // max(1, cfg.n_heads))
+    if cfg.model_mode == "gpt":
+        attn_layers = L
+    elif cfg.use_transformer_attention:
+        attn_layers = sum(1 for i in range(L)
+                          if (i + 1) % cfg.attention_every_n_layers == 0 or i == L - 1)
+    else:
+        attn_layers = 0
+    kv_cache = 2 * T * n_kv * head_dim * attn_layers * act_bytes
+    ssm_state = d * L * act_bytes if cfg.model_mode != "gpt" else 0
+    conv_state = d * max(0, cfg.kernel_size - 1) * L * act_bytes if cfg.model_mode != "gpt" else 0
+    activations = B * (2 * T * d * act_bytes + 8 * d * act_bytes * max(1, L))
+    logits = B * vocab_size * act_bytes
+    subtotal = weights + kv_cache + ssm_state + conv_state + activations + logits
     return {
         "weights": float(weights),
         "kv_cache": float(kv_cache),
         "activations": float(activations),
         "logits": float(logits),
-        "context": float(context),
+        "context": 0.0,
         "total": float(subtotal),
-        "with_margin": float(subtotal * 1.05),
+        "with_margin": float(subtotal + max(32 * 1024 * 1024, subtotal * 0.03)),
     }
 
 
@@ -3044,11 +3425,11 @@ def format_vram_report(cfg: Config, vocab_size: int) -> str:
     return "\n".join(lines)
 
 
-def get_available_gpu_bytes() -> Optional[int]:
+def get_available_gpu_bytes(device=None) -> Optional[int]:
     if not torch.cuda.is_available():
         return None
     try:
-        free, total = torch.cuda.mem_get_info()
+        free, total = torch.cuda.mem_get_info(device)
         return free
     except Exception:
         return None
@@ -3105,6 +3486,14 @@ def _adapt(w: torch.Tensor, target_shape) -> torch.Tensor:
     return out.reshape(target_shape)
 
 
+def _adapt_matrix_orientation(w: torch.Tensor, target_shape) -> torch.Tensor:
+    if tuple(w.shape) == tuple(target_shape):
+        return w
+    if w.dim() == 2 and tuple(w.t().shape) == tuple(target_shape):
+        return w.t().contiguous()
+    return _adapt(w, target_shape)
+
+
 def _svd_conv_kernel(wq, wk, wv, d_aura, kernel_size, n_heads, decay=0.5):
     d_src = wq.shape[1]
     stacked = torch.cat([wq.float(), wk.float(), wv.float()], dim=0)
@@ -3128,8 +3517,10 @@ def _svd_conv_kernel(wq, wk, wv, d_aura, kernel_size, n_heads, decay=0.5):
 
 def _find_tensor(tensors, *patterns):
     for pat in patterns:
+        suffix = pat.lower()
         for k, v in tensors.items():
-            if pat.lower() in k.lower():
+            key = k.lower()
+            if key == suffix or key.endswith("." + suffix):
                 return v
     return None
 
@@ -3179,6 +3570,14 @@ def convert_gguf_to_aura(gguf_path, output_path, cfg: Config, log=print):
         # user's settings values are only a fallback when metadata is missing.
         meta, gguf_codec = read_gguf_metadata(gguf_path, log=log)
         arch = meta.get("arch", "")
+        tokenizer_model = meta.get("tokenizer_model", "")
+        tokenizer_pre = meta.get("tokenizer_pre", "")
+        if tokenizer_model not in ("llama", "spm", "unigram", "sentencepiece") \
+            or "bpe" in tokenizer_pre:
+            raise RuntimeError(
+            f"GGUF tokenizer model '{tokenizer_model or '?'}' / pre-tokenizer "
+            f"'{tokenizer_pre or '?'}' is not source-compatible with the built-in "
+            "SentencePiece encoder; refusing a potentially garbled conversion")
         log(f"[GGUF] arch={arch or '?'} name={meta.get('name','?')} "
             f"d_model={meta.get('d_model')} layers={meta.get('n_layers')} "
             f"heads={meta.get('n_heads')} ff={meta.get('ff')} ctx={meta.get('ctx')}")
@@ -3197,40 +3596,54 @@ def convert_gguf_to_aura(gguf_path, output_path, cfg: Config, log=print):
             log(f"[rope] uniform theta={cfg.rope_base:.0f} (from GGUF metadata)")
     
         # ---- 2) Architecture detection: pure transformer (GPTBlock) vs hyena (HyenaBlock)
-        PURE_TRANSFORMER_ARCHS = {"gpt2", "gpt3", "gptj", "gemma", "gemma2", "gemma3",
-                                   "llama", "mistral", "phi", "phi3", "stablelm", "falcon"}
+        PURE_TRANSFORMER_ARCHS = {"llama", "mistral", "qwen2", "gemma", "gemma2", "gemma3", "phi3"}
         is_pure = (arch in PURE_TRANSFORMER_ARCHS)
-        if is_pure:
-            cfg.model_mode = "gpt"
-            cfg.gated_mlp = True   # gemma/llama both use gated GLU
-            cfg.pos_encoding = "rope"
-            cfg.qk_norm = arch.startswith("gemma")
-            nkv = meta.get("n_kv_heads", 0)
-            if nkv and 0 < nkv < cfg.n_heads:
-                cfg.n_kv_heads = nkv
-            hd = meta.get("head_dim", 0)
-            if hd:
-                cfg.attn_head_dim = hd
-            cfg.ff_dim = meta.get("ff", 0) or (cfg.d_model * 4)
-            log(f"[arch] pure transformer detected -> GPT mode "
-                f"(gated_mlp={cfg.gated_mlp} qk_norm={cfg.qk_norm} "
-                f"n_kv_heads={cfg.n_kv_heads} head_dim={cfg.attn_head_dim})")
-        else:
-            cfg.model_mode = "hyena"
-            log("[arch] hyena/hybrid mode (HyenaBlock + optional attention)")
+        if not is_pure:
+            if arch in ("qwen35", "qwen35moe"):
+                raise RuntimeError("Qwen3.5 uses hybrid Gated DeltaNet recurrent layers and MRoPE; "
+                                   "Aura currently has neither operator, so a faithful conversion "
+                                   "is not supported. No checkpoint was written.")
+            raise RuntimeError(f"GGUF architecture '{arch or 'unknown'}' is not yet supported for a faithful "
+                               "Aura transplant. Conversion into the unrelated Hyena block would produce "
+                               "misleading, likely gibberish output.")
+        cfg.model_mode = "gpt"
+        cfg.use_transformer_attention = True
+        cfg.gated_mlp = True
+        cfg.norm_type = "rmsnorm"
+        cfg.norm_eps = meta.get("norm_eps", 1e-5)
+        cfg.mlp_activation = "gelu_tanh" if arch.startswith("gemma") else "silu"
+        cfg.pos_encoding = "rope"
+        cfg.qk_norm = arch.startswith("gemma")
+        nkv = meta.get("n_kv_heads", 0)
+        cfg.n_kv_heads = min(nkv, cfg.n_heads) if nkv > 0 else cfg.n_heads
+        hd = meta.get("head_dim", 0)
+        if hd:
+            cfg.attn_head_dim = hd
+        cfg.ff_dim = meta.get("ff", 0) or (cfg.d_model * 4)
+        log(f"[arch] {arch} -> GPT-compatible transplant "
+            f"(norm={cfg.norm_type}, act={cfg.mlp_activation}, qk_norm={cfg.qk_norm}, "
+            f"n_kv_heads={cfg.n_kv_heads}, head_dim={cfg.attn_head_dim})")
         cfg.validate()
     
-        if gguf_codec is not None:
-            codec = gguf_codec
-            cfg.encoding = codec.encoding_name          # e.g. "gguf:gemma3"
-            log(f"[tokenizer] GGUF-native unigram vocab={codec.vocab_size:,} "
-                f"(IDs round-trip 1:1 with the source model)")
-        else:
-            codec = TiktokenCodec(cfg.encoding)
-            log(f"[tokenizer] WARNING: no GGUF vocab found; tiktoken '{cfg.encoding}' "
-                f"fallback -- embedding rows will be interpolated (quality loss)")
+        if gguf_codec is None:
+            raise RuntimeError("GGUF has no recognized native tokenizer vocabulary. A tiktoken fallback "
+                               "would mismatch embedding IDs and produce unusable output.")
+        codec = gguf_codec
+        cfg.encoding = codec.encoding_name
+        log(f"[tokenizer] GGUF-native vocab={codec.vocab_size:,} "
+            "(source token IDs preserved)")
     
         tensors = read_gguf_tensors(gguf_path, log=log)
+        source_embedding = _find_tensor(tensors, "token_embd.weight", "token_emb.weight",
+                                        "embed_tokens.weight", "wte.weight")
+        if source_embedding is None:
+            raise RuntimeError("GGUF has no recognized token embedding tensor; refusing to save a random model")
+        if tuple(source_embedding.shape) not in ((codec.vocab_size, cfg.d_model),
+                                                   (cfg.d_model, codec.vocab_size)):
+            raise RuntimeError(f"token embedding shape {tuple(source_embedding.shape)} does not match "
+                               f"native tokenizer/model dimensions ({codec.vocab_size}, {cfg.d_model})")
+        output_w = _find_tensor(tensors, "output.weight", "lm_head.weight")
+        cfg.untie_head = output_w is not None
         model = AuraLM(codec.vocab_size, cfg.d_model, cfg.n_layers, cfg.kernel_size,
                         cfg.n_heads, cfg.dropout, cfg.seq_len, cfg.use_transformer_attention,
                         grad_checkpoint=cfg.grad_checkpoint,
@@ -3240,7 +3653,10 @@ def convert_gguf_to_aura(gguf_path, output_path, cfg: Config, log=print):
                         gated_mlp=cfg.gated_mlp, attn_head_dim=cfg.attn_head_dim,
                         n_kv_heads=cfg.n_kv_heads, qk_norm=cfg.qk_norm,
                         ff_dim=cfg.ff_dim,
-                        model_mode=cfg.model_mode)
+                        model_mode=cfg.model_mode,
+                        attention_every_n_layers=cfg.attention_every_n_layers,
+                        norm_type=cfg.norm_type, norm_eps=cfg.norm_eps,
+                        mlp_activation=cfg.mlp_activation)
         log(f"Aura model: {model.count_parameters():,} params "
             f"(d_model={cfg.d_model}, layers={cfg.n_layers}, heads={cfg.n_heads}, "
             f"vocab={codec.vocab_size:,})")
@@ -3258,20 +3674,28 @@ def convert_gguf_to_aura(gguf_path, output_path, cfg: Config, log=print):
                               "embed_tokens.weight", "wte.weight")
         if emb_w is not None:
             emb_w = emb_w.float()
-            if emb_w.shape[0] == codec.vocab_size:
+            if tuple(emb_w.shape) == (codec.vocab_size, dz):
                 adapted = emb_w.clone()      # exact 1:1 copy -- the common case now
             else:
-                adapted = _adapt(emb_w, (codec.vocab_size, dz))
+                adapted = _adapt_matrix_orientation(emb_w, (codec.vocab_size, dz))
                 log(f"  [warn] vocab mismatch {emb_w.shape[0]} vs {codec.vocab_size}; interpolated")
             with torch.no_grad():
                 model.wte.weight.copy_(adapted)
-                model.lm_head.weight = model.wte.weight
             log(f"embedding {tuple(emb_w.shape)} -> ({codec.vocab_size},{dz})")
+
+        if output_w is not None:
+            with torch.no_grad():
+                model.lm_head.weight.copy_(_adapt_matrix_orientation(
+                    output_w.float(), model.lm_head.weight.shape))
+            log(f"output head {tuple(output_w.shape)} -> {tuple(model.lm_head.weight.shape)} (untied)")
     
-        ln_w = _find_tensor(tensors, "output_norm.weight", "norm.weight", "ln_f.weight")
+        missing_required = []
+        ln_w = _find_tensor(tensors, "output_norm.weight", "model.norm.weight", "ln_f.weight")
         if ln_w is not None:
             with torch.no_grad():
                 model.ln_f.weight.copy_(_adapt(ln_w.float(), (dz,)) + norm_offset)
+        else:
+            missing_required = ["final normalization weight"]
     
         detected = set()
         for k in tensors:
@@ -3283,7 +3707,7 @@ def convert_gguf_to_aura(gguf_path, output_path, cfg: Config, log=print):
                         pass
         n_src = max(detected) + 1 if detected else cfg.n_layers
         log(f"detected {n_src} source layers -> mapping to {cfg.n_layers} Aura layers")
-    
+
         for zi in range(cfg.n_layers):
             si = int(round(zi * (n_src - 1) / max(cfg.n_layers - 1, 1))) if cfg.n_layers > 1 else 0
             block = model.core.layers[zi]
@@ -3293,59 +3717,90 @@ def convert_gguf_to_aura(gguf_path, output_path, cfg: Config, log=print):
             wv = _ensure_2d(_find_layer_tensor(tensors, si, "attn_v.weight", "self_attn.v_proj.weight", "v_proj.weight"))
             wo = _ensure_2d(_find_layer_tensor(tensors, si, "attn_output.weight", "self_attn.o_proj.weight", "o_proj.weight"))
             c_attn = _ensure_2d(_find_layer_tensor(tensors, si, "attn.c_attn.weight", "c_attn.weight"))
+            fused_qkv = _ensure_2d(_find_layer_tensor(tensors, si, "attn_qkv.weight", "query_key_value.weight"))
             if c_attn is not None and wq is None:
-                d = c_attn.shape[0] // 3
-                wq, wk, wv = c_attn[:d], c_attn[d:2*d], c_attn[2*d:]
+                fused_qkv = c_attn
+            if fused_qkv is not None and wq is None:
+                head_dim = cfg.attn_head_dim or max(1, dz // cfg.n_heads)
+                q_width = cfg.n_heads * head_dim
+                kv_width = (cfg.n_kv_heads or cfg.n_heads) * head_dim
+                sizes = (q_width, kv_width, kv_width)
+                if fused_qkv.shape[0] == dz and fused_qkv.shape[1] == sum(sizes):
+                    wq, wk, wv = fused_qkv.split(sizes, dim=1)
+                elif fused_qkv.shape[1] == dz and fused_qkv.shape[0] == sum(sizes):
+                    wq, wk, wv = fused_qkv.split(sizes, dim=0)
+                else:
+                    log(f"[WARN] layer {si} fused QKV shape {tuple(fused_qkv.shape)} "
+                        f"does not match expected input/output widths {dz}/{sum(sizes)}")
     
             if isinstance(block, GPTBlock):
                 # ---- GPT MODE: direct-weight transplant (no conv SVD) ----
                 # GGUF stores weights as (in, out); PyTorch Linear is (out, in).
                 # Transpose before _adapt so bilinear mapping respects dimensions.
                 # Each Q/K/V adapted to its own sub-slice, then cat'd ONCE on dim 0.
-                if wq is not None:
-                    wk = wk if wk is not None else wq.clone()
-                    wv = wv if wv is not None else wq.clone()
+                if wq is not None and wk is not None and wv is not None:
                     attn = block.attn
-                    qs = _adapt(wq.float().t().contiguous(), (attn.inner, dz))
-                    ks = _adapt(wk.float().t().contiguous(), (attn.kv_inner, dz))
-                    vs = _adapt(wv.float().t().contiguous(), (attn.kv_inner, dz))
+                    qs = _adapt_matrix_orientation(wq.float(), (attn.inner, dz))
+                    ks = _adapt_matrix_orientation(wk.float(), (attn.kv_inner, dz))
+                    vs = _adapt_matrix_orientation(wv.float(), (attn.kv_inner, dz))
                     fused = torch.cat([qs, ks, vs], dim=0)
                     with torch.no_grad():
                         attn.c_attn.weight.copy_(fused)
+                    if cfg.qk_norm:
+                        q_norm = _find_layer_tensor(tensors, si, "attn_q_norm.weight", "q_norm.weight")
+                        k_norm = _find_layer_tensor(tensors, si, "attn_k_norm.weight", "k_norm.weight")
+                        if q_norm is not None:
+                            with torch.no_grad():
+                                attn.q_norm.copy_(_adapt(q_norm.float(), attn.q_norm.shape) + norm_offset)
+                        if k_norm is not None:
+                            with torch.no_grad():
+                                attn.k_norm.copy_(_adapt(k_norm.float(), attn.k_norm.shape) + norm_offset)
+                        if q_norm is None or k_norm is None:
+                            missing_required.append(f"layer {si} q/k normalization")
+                else:
+                    missing_required.append(f"layer {si} complete Q/K/V attention weights")
                 if wo is not None:
                     tgt = block.attn.c_proj.weight
                     with torch.no_grad():
-                        tgt.copy_(_adapt(wo.float().t().contiguous(), tgt.shape))
+                        tgt.copy_(_adapt_matrix_orientation(wo.float(), tgt.shape))
+                else:
+                    missing_required.append(f"layer {si} attention output weight")
     
                 # FFN / MLP (GGUF: (in,out); PyTorch Linear: (out,in) -> .t() first)
                 ffn_gate = _ensure_2d(_find_layer_tensor(tensors, si, "ffn_gate.weight", "mlp.gate_proj.weight"))
                 ffn_up = _ensure_2d(_find_layer_tensor(tensors, si, "ffn_up.weight", "mlp.up_proj.weight"))
                 ffn_dn = _ensure_2d(_find_layer_tensor(tensors, si, "ffn_down.weight", "mlp.down_proj.weight", "fc2.weight"))
+                if ffn_gate is None or ffn_up is None or ffn_dn is None:
+                    missing_required.append(f"layer {si} complete gated FFN weights")
                 mlp = block.mlp
                 for src, attr in [(ffn_gate, 'gate_proj'), (ffn_up, 'up_proj')]:
                     if src is not None and hasattr(mlp, attr):
                         tgt_w = getattr(mlp, attr).weight
                         with torch.no_grad():
-                            tgt_w.copy_(_adapt(src.float().t().contiguous(), tgt_w.shape))
+                            tgt_w.copy_(_adapt_matrix_orientation(src.float(), tgt_w.shape))
                     elif src is not None and attr == 'gate_proj':
                         pass  # non-gated MLP ignores gate_proj
                 if ffn_dn is not None and hasattr(mlp, 'down_proj'):
                     tgt_w = mlp.down_proj.weight
                     with torch.no_grad():
-                        tgt_w.copy_(_adapt(ffn_dn.float().t().contiguous(), tgt_w.shape))
+                        tgt_w.copy_(_adapt_matrix_orientation(ffn_dn.float(), tgt_w.shape))
                 elif ffn_dn is not None and hasattr(mlp, 'c_proj'):
                     tgt_w = mlp.c_proj.weight
                     with torch.no_grad():
-                        tgt_w.copy_(_adapt(ffn_dn.float().t().contiguous(), tgt_w.shape))
+                        tgt_w.copy_(_adapt_matrix_orientation(ffn_dn.float(), tgt_w.shape))
     
                 ln1_gpt = _find_layer_tensor(tensors, si, "attn_norm.weight", "input_layernorm.weight")
                 if ln1_gpt is not None:
                     with torch.no_grad():
                         block.ln_1.weight.copy_(_adapt(ln1_gpt.float(), (dz,)) + norm_offset)
+                else:
+                    missing_required.append(f"layer {si} attention normalization weight")
                 ln2_gpt = _find_layer_tensor(tensors, si, "ffn_norm.weight", "post_attention_layernorm.weight")
                 if ln2_gpt is not None:
                     with torch.no_grad():
                         block.ln_2.weight.copy_(_adapt(ln2_gpt.float(), (dz,)) + norm_offset)
+                else:
+                    missing_required.append(f"layer {si} FFN normalization weight")
                 if zi == 0 or zi == cfg.n_layers - 1:
                     log(f"layer {zi} <- source {si} (c_attn=Q|K|V, c_proj=Wo, "
                         f"mlp=gate|up|down, norms +{norm_offset:.0f})")
@@ -3392,6 +3847,10 @@ def convert_gguf_to_aura(gguf_path, output_path, cfg: Config, log=print):
                     log(f"layer {zi} <- source {si} (conv=SVD(QKV), c_attn=Q|K|V, "
                         f"gate/c_proj=Wo, ffn=gate/down, norms +{norm_offset:.0f})")
     
+        if missing_required:
+            summary = "; ".join(dict.fromkeys(missing_required[:12]))
+            raise RuntimeError(f"GGUF conversion incomplete; required tensors were not mapped: {summary}")
+
         del tensors
         gc.collect()
         if torch.cuda.is_available():
@@ -3562,6 +4021,47 @@ def infer_conv_layer_specs(state_dict: dict, n_layers_hint: int):
     return n_layers, specs
 
 
+def infer_attention_geometry(state_dict: dict, n_layers: int, n_heads: int,
+                             d_model: int, configured_head_dim: int,
+                             configured_kv_heads: int, log=print):
+    """Recover Q/K/V dimensions from saved weights when a checkpoint's config
+    was changed after its model was built (for example, live GQA settings)."""
+    current_head_dim = configured_head_dim or max(1, d_model // max(1, n_heads))
+    current_kv_heads = configured_kv_heads or n_heads
+    geometries = set()
+    for i in range(n_layers):
+        qkv = state_dict.get(f"core.layers.{i}.attn.c_attn.weight")
+        out = state_dict.get(f"core.layers.{i}.attn.c_proj.weight")
+        if qkv is None or out is None or qkv.dim() != 2 or out.dim() != 2:
+            continue
+        q_width = out.size(1)
+        if q_width <= 0 or q_width % max(1, n_heads) != 0:
+            continue
+        head_dim = q_width // max(1, n_heads)
+        kv_width_total = qkv.size(0) - q_width
+        if head_dim <= 0 or kv_width_total <= 0 or kv_width_total % 2:
+            continue
+        kv_width = kv_width_total // 2
+        if kv_width % head_dim:
+            continue
+        kv_heads = kv_width // head_dim
+        if (kv_heads < 1 or kv_heads > n_heads or n_heads % kv_heads
+                or qkv.size(1) != d_model or out.size(0) != d_model):
+            continue
+        geometries.add((head_dim, kv_heads))
+
+    if len(geometries) != 1:
+        if len(geometries) > 1:
+            log("[load] attention tensor geometry varies by layer; retaining checkpoint config")
+        return current_head_dim, current_kv_heads
+
+    head_dim, kv_heads = geometries.pop()
+    if head_dim != current_head_dim or kv_heads != current_kv_heads:
+        log(f"[load] attention geometry from checkpoint tensors: head_dim "
+            f"{current_head_dim}->{head_dim}, kv_heads {current_kv_heads}->{kv_heads}")
+    return head_dim, kv_heads
+
+
 def adapt_checkpoint_for_new_n_heads(state_dict: dict, n_layers: int,
                                       target_n_heads: int, log=print) -> dict:
     new_sd = dict(state_dict)
@@ -3588,6 +4088,15 @@ def adapt_checkpoint_for_new_n_heads(state_dict: dict, n_layers: int,
 # =====================================================================
 # TRAINER
 # =====================================================================
+class _HiddenForward(nn.Module):
+    def __init__(self, model: AuraLM):
+        super().__init__()
+        self.model = model
+
+    def forward(self, token_ids):
+        return self.model.forward_hidden(token_ids)
+
+
 class Trainer:
     def __init__(self, config: Config, log_fn=print, progress_fn=None):
         self.config = config
@@ -3600,6 +4109,7 @@ class Trainer:
         self.model: Optional[AuraLM] = None
         self.optimizer = None
         self.scheduler = None
+        self._parallel_hidden = None
         self.loss_history: List[float] = []
         self.epoch = 0
         self.stage = "idle"
@@ -3607,11 +4117,14 @@ class Trainer:
         self._pause = threading.Event()
         self._amp_dtype = None
         self.train_data: Optional[torch.Tensor] = None
+        self.val_data: Optional[torch.Tensor] = None
+        self.best_val_loss = float("inf")
+        self._speaker_names = set()
         self.ewc = EWCState()
         self.eta = ETATracker()
         self._built_structural = {}
         self._recent_losses: List[float] = []   # item 11: stop-loss running average
-        self.gen_lock = threading.Lock()        # E3: one generation in flight (UI+API)
+        self.gen_lock = threading.RLock()       # serializes inference, loading, and training
 
         # v11 additions
         self.astralis = AuroraAstralis(max_bytes=int(config.astralis_max_kb * 1024))
@@ -3652,9 +4165,28 @@ class Trainer:
                         qk_norm=getattr(self.config, "qk_norm", False),
                         ff_dim=getattr(self.config, "ff_dim", 0),
                         untie_head=getattr(self.config, "untie_head", False),
-                        model_mode=self.config.model_mode)
+                        model_mode=self.config.model_mode,
+                        attention_every_n_layers=self.config.attention_every_n_layers,
+                        norm_type=self.config.norm_type, norm_eps=self.config.norm_eps,
+                        mlp_activation=self.config.mlp_activation)
         model, self._amp_dtype = apply_dtype_to_model(model, self.config.train_dtype, self.config.device, self.log)
         self.model = model
+        self._parallel_hidden = None
+        if self.config.multi_gpu:
+            if not torch.cuda.is_available() or min(torch.cuda.device_count(), self.config.batch_size) < 2:
+                self.log("[multi-GPU] at least 2 CUDA devices and 2 batch rows are required; using one GPU")
+            elif self.config.train_dtype in ("q4", "q8"):
+                self.log("[multi-GPU] bitsandbytes quantized layers are not enabled for DataParallel; using one GPU")
+            else:
+                primary = next(model.parameters()).device.index
+                if primary is None:
+                    primary = torch.cuda.current_device()
+                device_ids = ([primary] + [i for i in range(torch.cuda.device_count()) if i != primary])[
+                    :min(torch.cuda.device_count(), self.config.batch_size)]
+                self._parallel_hidden = nn.DataParallel(
+                    _HiddenForward(model), device_ids=device_ids, output_device=primary)
+                self.log(f"[multi-GPU] training batches across CUDA devices {device_ids}; "
+                         "optimizer and checkpoint remain on the primary device")
         no_decay = ["bias", "norm", "ln_f", "wte", "wpe"]
         # Only trainable params go to the optimizer (q4/q8 frozen linears excluded).
         groups = [
@@ -3686,21 +4218,43 @@ class Trainer:
         informative console message rather than letting CUDA OOM crash the app."""
         if self.config.device != "cuda" or not torch.cuda.is_available():
             return False, "GPU only is enabled but no CUDA device is available"
-        codec = TiktokenCodec(self.config.encoding)
-        est_bytes = estimate_model_vram_bytes(self.config, codec.vocab_size)
-        free_bytes = get_available_gpu_bytes()
-        if free_bytes is None:
-            return False, "could not query free GPU memory"
-        est_gb, free_gb = est_bytes / 1e9, free_bytes / 1e9
-        if est_bytes > free_bytes:
-            return False, (f"estimated need ~{est_gb:.2f}GB VRAM (weights+grad+optimizer+margin) "
-                           f"exceeds free VRAM ~{free_gb:.2f}GB. Reduce d_model/n_layers/batch_size, "
-                           f"or use a smaller dtype (bf16/q8/q4).")
-        self.log(f"[GPU only] estimated ~{est_gb:.2f}GB needed, ~{free_gb:.2f}GB free -> OK")
+        estimate = predict_vram_usage(self.config, self.codec.vocab_size)
+        est_bytes = int(estimate["total"])
+        n_devices = (min(torch.cuda.device_count(), self.config.batch_size) if self.config.multi_gpu
+                     and self.config.train_dtype not in ("q4", "q8") else 1)
+        primary = torch.device(self.config.device).index
+        if primary is None:
+            primary = torch.cuda.current_device()
+        device_ids = [primary] + [i for i in range(torch.cuda.device_count()) if i != primary]
+        device_ids = device_ids[:n_devices]
+        checks = []
+        for device_id in device_ids:
+            free_bytes = get_available_gpu_bytes(device_id)
+            if free_bytes is None:
+                return False, f"could not query free memory for CUDA:{device_id}"
+            required = est_bytes
+            if device_id != primary:
+                grad_bytes = 4 if self.config.train_dtype in ("amp_bf16", "amp_fp16", "fp32") else 2
+                required = int(estimate["weights"] +
+                               estimate["params"] * grad_bytes +
+                               (estimate["activations"] + estimate["logits"]) / max(1, n_devices)
+                               + 64 * 1024 * 1024)
+            checks.append((device_id, required, free_bytes))
+        failures = [(device_id, required, free) for device_id, required, free in checks
+                    if required > free]
+        if failures:
+            device_id, required, free = failures[0]
+            return False, (f"CUDA:{device_id} needs ~{required/1e9:.2f}GB but has "
+                           f"~{free/1e9:.2f}GB free. Reduce d_model/n_layers/batch_size "
+                           "or use a smaller dtype (bf16/q8/q4).")
+        self.log("[GPU only] estimated per-device VRAM: " + ", ".join(
+            f"CUDA:{device_id} ~{required/1e9:.2f}GB / {free/1e9:.2f}GB free"
+            for device_id, required, free in checks))
         return True, ""
 
     def _free_model(self):
         self.model = self.optimizer = self.scheduler = None
+        self._parallel_hidden = None
         self._amp_dtype = None
         gc.collect()
         if torch.cuda.is_available():
@@ -3727,6 +4281,7 @@ class Trainer:
     def _release_for_pause(self):
         self.model = None
         self.optimizer = None
+        self._parallel_hidden = None
         gc.collect()
         if torch.cuda.is_available():
             try:
@@ -3747,7 +4302,7 @@ class Trainer:
     # ---- data ----
     def _load_corpus(self, path):
         if not os.path.exists(path):
-            path = ErdosStrausGenerator.generate_dataset(output_path=path if path else "aura_fallback_data.txt")
+            raise FileNotFoundError(f"training corpus not found: {path}")
         self.stage = "tokenizing"
         # If using the character codec, allow it to extend with any new characters
         if getattr(self.codec, 'mode', '') == 'char' and hasattr(self.codec, 'extend_with_text'):
@@ -3775,8 +4330,47 @@ class Trainer:
                                 self.log(f"[model] expanded embeddings to vocab={new_vocab}")
             except Exception:
                 pass
-        self.train_data = load_tokens_with_cache(path, self.codec, self.config.cache_dir, self.log)
-        self.log(f"corpus ready: {len(self.train_data):,} tokens")
+        tokens = load_tokens_with_cache(path, self.codec, self.config.cache_dir, self.log)
+        split = int(tokens.numel() * 0.9)
+        if split > self.config.seq_len and tokens.numel() - split > self.config.seq_len:
+            self.train_data, self.val_data = tokens[:split], tokens[split:]
+        elif tokens.numel() > self.config.seq_len:
+            self.train_data, self.val_data = tokens, None
+            self.log("[data] corpus too small for a validation window; using all tokens for training")
+        else:
+            raise ValueError(f"training corpus has {tokens.numel()} tokens; "
+                             f"seq_len={self.config.seq_len} requires at least "
+                             f"{self.config.seq_len + 1} tokens")
+        self.best_val_loss = float("inf")
+        self._speaker_names = {str(self.config.user_name).strip(),
+                               str(self.config.assistant_name).strip(),
+                               self.config.speaker_identity or self.config.assistant_name}
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as corpus_file:
+                for line in corpus_file:
+                    match = re.match(r"^\s*([^:\r\n]{1,40}):(?:\s|$)", line)
+                    if match and match.group(1).strip():
+                        self._speaker_names.add(match.group(1).strip())
+        except OSError:
+            pass
+        if (self.config.dataset_on_device and str(self.config.device).startswith("cuda")
+                and torch.cuda.is_available() and self.train_data.device.type == "cpu"):
+            try:
+                free_bytes, _ = torch.cuda.mem_get_info()
+                data_bytes = self.train_data.numel() * self.train_data.element_size()
+                if self.val_data is not None:
+                    data_bytes += self.val_data.numel() * self.val_data.element_size()
+                if data_bytes <= max(0, free_bytes - 1024 ** 3):
+                    self.train_data = self.train_data.to(self.config.device)
+                    if self.val_data is not None:
+                        self.val_data = self.val_data.to(self.config.device)
+                    self.log(f"[data] cached {data_bytes / 1024**2:.1f} MB token corpus on {self.config.device}")
+                else:
+                    self.log("[data] GPU corpus cache skipped; preserving 1 GiB free-memory reserve")
+            except Exception as e:
+                self.log(f"[data] GPU corpus cache skipped ({e})")
+        self.log(f"corpus ready: train={len(self.train_data):,} tokens, "
+             f"val={len(self.val_data) if self.val_data is not None else 0:,} tokens")
         # build char-level word frequency map for reward shaping if requested
         if getattr(self.codec, 'mode', '') == 'char':
             try:
@@ -3797,15 +4391,46 @@ class Trainer:
                 self._char_word_freqs = {}
         return self.train_data
 
-    def _get_batch(self):
-        data = self.train_data
+    def _get_batch(self, data=None):
+        data = self.train_data if data is None else data
         bs = self.config.batch_size
         sl = self.config.seq_len
-        max_start = max(1, len(data) - sl - 1)
-        ix = torch.randint(0, max_start, (bs,))
-        x = torch.stack([data[i:i + sl] for i in ix])
-        y = torch.stack([data[i + 1:i + sl + 1] for i in ix])
-        return x.to(self.config.device), y.to(self.config.device)
+        if data is None or len(data) <= sl:
+            available = 0 if data is None else len(data)
+            raise ValueError(f"need at least seq_len + 1 ({sl + 1}) corpus tokens; got {available}")
+        max_start = len(data) - sl
+        starts = torch.randint(0, max_start, (bs,), device=data.device)
+        offsets = torch.arange(sl + 1, device=data.device)
+        batch = data[starts[:, None] + offsets]
+        target_device = torch.device(self.config.device)
+        return (batch[:, :-1].to(target_device, non_blocking=True),
+                batch[:, 1:].to(target_device, non_blocking=True))
+
+    def _estimate_validation_loss(self, n_batches=8):
+        if self.val_data is None or self.model is None:
+            return None
+        was_training = self.model.training
+        self.model.eval()
+        losses = []
+        amp_ctx = (torch.amp.autocast("cuda", dtype=self._amp_dtype)
+                   if self._amp_dtype is not None and str(self.config.device).startswith("cuda")
+                   else contextlib.nullcontext())
+        try:
+            with torch.inference_mode():
+                for _ in range(n_batches):
+                    x, y = self._get_batch(self.val_data)
+                    with amp_ctx:
+                        hidden = self._forward_hidden(x)
+                        loss = self._compute_chunked_head_loss(hidden, y)
+                    losses.append(float(loss))
+        finally:
+            self.model.train(was_training)
+        return sum(losses) / len(losses) if losses else None
+
+    def _forward_hidden(self, token_ids):
+        if self._parallel_hidden is not None:
+            return self._parallel_hidden(token_ids)
+        return self.model.forward_hidden(token_ids)
 
     # ---- loss dispatch (item 9: every option is a real, differentiable loss) ----
     def _prefix_weight_tensor(self, y: torch.Tensor) -> Optional[torch.Tensor]:
@@ -3815,31 +4440,26 @@ class Trainer:
         wgt = float(getattr(self.config, "prefix_loss_weight", 1.0))
         if wgt <= 1.0:
             return None
-        key = (self.codec.encoding_name, self.config.user_name, self.config.assistant_name)
+        identity = self.config.speaker_identity or self.config.assistant_name
+        key = (self.codec.encoding_name, identity)
         if getattr(self, "_prefix_key", None) != key:
             seqs, seen = [], set()
-            for name in (self.config.user_name, self.config.assistant_name):
-                for variant in (f"\n{name}:", f"{name}:"):
-                    ids = tuple(self.codec.encode(variant))
-                    if ids and ids not in seen:
-                        seen.add(ids)
-                        seqs.append(torch.tensor(ids, dtype=torch.long))
+            for variant in (f"\n{identity}:", f"{identity}:"):
+                ids = tuple(self.codec.encode(variant))
+                if ids and ids not in seen:
+                    seen.add(ids)
+                    seqs.append(torch.tensor(ids, dtype=torch.long))
             self._prefix_seqs = seqs
             self._prefix_key = key
         mask = torch.zeros_like(y, dtype=torch.bool)
-        any_hit = False
         for s in self._prefix_seqs:
             L = s.numel()
             if L == 0 or y.size(1) < L:
                 continue
             hits = (y.unfold(1, L, 1) == s.to(y.device).view(1, 1, L)).all(dim=2)
-            if hits.any():
-                any_hit = True
-                W = hits.size(1)
-                for off in range(L):
-                    mask[:, off:off + W] |= hits
-        if not any_hit:
-            return None
+            W = hits.size(1)
+            for off in range(L):
+                mask[:, off:off + W] |= hits
         w = torch.ones_like(y, dtype=torch.float32)
         w[mask] = wgt
         return w
@@ -3862,6 +4482,39 @@ class Trainer:
                                         char_word_freqs=getattr(self, '_char_word_freqs', None),
                                         char_reward_scale=getattr(self.config, 'char_reward_scale', 0.0))
 
+    def _compute_chunked_head_loss(self, hidden, targets, chunk_rows=512, loss_fn_override=None):
+        fn = loss_fn_override or self.config.loss_fn
+        if fn not in ("cross_entropy", "label_smoothing", "focal"):
+            logits = self.model.lm_head(hidden)
+            return self._compute_loss(logits, targets)
+        weights = self._prefix_weight_tensor(targets)
+        flat_hidden = hidden.reshape(-1, hidden.size(-1))
+        flat_targets = targets.reshape(-1)
+        flat_weights = (weights.reshape(-1) if weights is not None
+                        else torch.ones_like(flat_targets, dtype=torch.float32))
+        weight_sum = flat_weights.sum().clamp(min=1e-8)
+        smoothing = 0.1 if fn == "label_smoothing" else 0.0
+        def chunk_loss(hidden_rows, target_rows, weight_rows):
+            logits = self.model.lm_head(hidden_rows)
+            ce = F.cross_entropy(logits.float(), target_rows, reduction="none",
+                                 label_smoothing=smoothing)
+            if fn == "focal":
+                ce = (1.0 - torch.exp(-ce)).pow(1.5) * ce
+            return (ce * weight_rows).sum()
+
+        total = None
+        for start in range(0, flat_hidden.size(0), chunk_rows):
+            end = start + chunk_rows
+            if flat_hidden.requires_grad:
+                part = torch_checkpoint.checkpoint(
+                    chunk_loss, flat_hidden[start:end], flat_targets[start:end],
+                    flat_weights[start:end], use_reentrant=False)
+            else:
+                part = chunk_loss(flat_hidden[start:end], flat_targets[start:end],
+                                  flat_weights[start:end])
+            total = part if total is None else total + part
+        return total / weight_sum
+
     # ---- EWC ----
     def compute_fisher(self, n_batches: Optional[int] = None):
         if self.model is None or self.train_data is None:
@@ -3869,21 +4522,37 @@ class Trainer:
             return
         n_batches = n_batches or self.config.ewc_samples
         self.log(f"[EWC] estimating diagonal Fisher over {n_batches} batches ...")
+        was_training = self.model.training
         self.model.eval()
         fisher = {n: torch.zeros_like(p, device="cpu") for n, p in self.model.named_parameters() if p.requires_grad}
-        for _ in range(n_batches):
-            if self._stop.is_set():
-                break
-            x, y = self._get_batch()
+        completed = 0
+        try:
+            for _ in range(n_batches):
+                if self._stop.is_set():
+                    break
+                x, y = self._get_batch()
+                self.optimizer.zero_grad(set_to_none=True)
+                amp_ctx = (torch.amp.autocast("cuda", dtype=self._amp_dtype)
+                           if self._amp_dtype is not None and str(self.config.device).startswith("cuda")
+                           else contextlib.nullcontext())
+                with amp_ctx:
+                    hidden = self._forward_hidden(x)
+                    loss = self._compute_chunked_head_loss(
+                        hidden, y, loss_fn_override="cross_entropy")
+                loss.backward()
+                for n, p in self.model.named_parameters():
+                    if p.grad is not None and n in fisher:
+                        fisher[n] += p.grad.detach().cpu().pow(2)
+                self.optimizer.zero_grad(set_to_none=True)
+                completed += 1
+        finally:
             self.optimizer.zero_grad(set_to_none=True)
-            _, loss = self.model(x, y)
-            loss.backward()
-            for n, p in self.model.named_parameters():
-                if p.grad is not None and n in fisher:
-                    fisher[n] += p.grad.detach().cpu().pow(2)
-            self.optimizer.zero_grad(set_to_none=True)
+            self.model.train(was_training)
+        if completed == 0:
+            self.log("[EWC] no Fisher batches completed; keeping previous state")
+            return
         for n in fisher:
-            fisher[n] /= max(1, n_batches)
+            fisher[n] /= completed
         self.ewc.fisher = fisher
         self.ewc.anchor = {n: p.data.detach().float().cpu().clone() for n, p in self.model.named_parameters() if p.requires_grad}
         self.ewc.pin()   # pinned CPU memory -> fast async streaming, ~0 VRAM held
@@ -3911,15 +4580,15 @@ class Trainer:
                     if line.startswith("Proof 4/") and ErdosStrausGenerator.verify_proof_line(line):
                         trigger = line.split("=")[0].strip()
                         self.astralis.commit(trigger, line, kind="erdos_straus", verified=True)
-                # 2) short verbatim ground-truth spans (trigger = end of context,
-                #    payload = start of the true next tokens). Bounded size so the
-                #    cache stays dense and useful for streaming shortcuts.
-                if len(text_x) >= 24 and len(text_y) >= 8:
+                # y is x shifted by one token. Pair a prefix ending at p with
+                # the continuation beginning at y[p - 1], not y[0].
+                split = max(1, len(row_x) - 48)
+                trigger_text = self.codec.decode(row_x[:split])
+                payload = self.codec.decode(row_y[split - 1:split - 1 + 48])
+                if len(trigger_text) >= 24 and payload.strip():
                     for tw in (64, 32):
-                        trigger = text_x[-tw:] if len(text_x) >= tw else text_x
-                        payload = text_y[:48]
-                        if payload.strip():
-                            self.astralis.commit(trigger, payload, kind="context_span", verified=True)
+                        self.astralis.commit(trigger_text[-tw:], payload,
+                                             kind="context_span", verified=True)
             except Exception as e:
                 self.log(f"[astralis] commit-from-batch failed: {e}")
         self.scratchpad.submit(work)
@@ -3959,6 +4628,7 @@ class Trainer:
         ep_target = extra_epochs if extra_epochs is not None else self.config.epochs
         ep = 0
         global_step = 0
+        optimizer_steps_run = 0
 
         while ep < ep_target and not self._stop.is_set() and not self._stop_loss_hit:
             ep += 1
@@ -3968,13 +4638,15 @@ class Trainer:
             if hasattr(self.model, "core"):
                 self.model.core.grad_checkpoint = bool(self.config.grad_checkpoint)
             epoch_loss, steps_this_epoch = 0.0, 0
+            optimizer_steps_this_epoch = 0
 
             data_len = len(self.train_data)
             windows = max(1, (data_len - self.config.seq_len) // self.config.seq_len)
             steps_per_epoch = max(1, windows // max(1, self.config.batch_size))
 
             for step in range(steps_per_epoch):
-                if self._pause.is_set() and not self._stop.is_set():
+                if (self._pause.is_set() and not self._stop.is_set()
+                    and step % self.config.grad_accumulation_steps == 0):
                     # Item 13: pause = persist model+optimizer to disk and RELEASE
                     # VRAM/RAM; resume = reload automatically and continue.
                     self.eta.pause()
@@ -4012,21 +4684,42 @@ class Trainer:
                 self.optimizer.param_groups[1]["lr"] = lr
 
                 x, y = self._get_batch()
+                noise_rate = float(getattr(self.config, "input_noise", 0.0))
+                if noise_rate > 0:
+                    noise_mask = torch.rand(x.shape, device=x.device) < noise_rate
+                    random_tokens = torch.randint(self.codec.vocab_size, x.shape,
+                                                  device=x.device, dtype=x.dtype)
+                    x = torch.where(noise_mask, random_tokens, x)
                 if use_amp:
                     with torch.amp.autocast('cuda', dtype=self._amp_dtype):
-                        logits, _ = self.model(x, None)
-                        loss = self._compute_loss(logits, y)
+                        if self.config.loss_fn == "anti_repetition":
+                            hidden = self._forward_hidden(x)
+                            logits = self.model.lm_head(hidden)
+                            loss = self._compute_loss(logits, y)
+                        else:
+                            hidden = self._forward_hidden(x)
+                            loss = self._compute_chunked_head_loss(hidden, y)
                 else:
-                    logits, _ = self.model(x, None)
-                    loss = self._compute_loss(logits, y)
+                    if self.config.loss_fn == "anti_repetition":
+                        hidden = self._forward_hidden(x)
+                        logits = self.model.lm_head(hidden)
+                        loss = self._compute_loss(logits, y)
+                    else:
+                        hidden = self._forward_hidden(x)
+                        loss = self._compute_chunked_head_loss(hidden, y)
 
                 if self.config.ewc_lambda > 0 and self.ewc.fisher is not None:
                     loss = loss + self.ewc.penalty(self.model, self.config.ewc_lambda, self.config.device)
 
-                loss = loss / self.config.grad_accumulation_steps
+                accum_steps = self.config.grad_accumulation_steps
+                group_size = min(accum_steps,
+                                 steps_per_epoch - (step // accum_steps) * accum_steps)
+                loss = loss / group_size
                 (scaler.scale(loss) if scaler else loss).backward()
 
-                if (step + 1) % self.config.grad_accumulation_steps == 0:
+                optimizer_step = ((step + 1) % accum_steps == 0
+                                  or step + 1 == steps_per_epoch)
+                if optimizer_step:
                     if scaler:
                         scaler.unscale_(self.optimizer)
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -4035,9 +4728,12 @@ class Trainer:
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                         self.optimizer.step()
                     self.optimizer.zero_grad(set_to_none=True)
+                    optimizer_steps_this_epoch += 1
+                    optimizer_steps_run += 1
 
-                step_loss = loss.item() * self.config.grad_accumulation_steps
-                epoch_loss += step_loss
+                step_loss_tensor = loss.detach() * group_size
+                epoch_loss = (epoch_loss + step_loss_tensor if torch.is_tensor(epoch_loss)
+                              else step_loss_tensor.clone())
                 global_step += 1
                 steps_this_epoch += 1
 
@@ -4048,35 +4744,48 @@ class Trainer:
                     self._astralis_commit_from_batch(x, y)
 
                 total_steps_est = ep_target * steps_per_epoch
-                eta_sec, sec_per_batch = self.eta.update(global_step, max(global_step, total_steps_est))
+                report_now = (global_step % self.config.progress_interval == 0
+                              or step + 1 == steps_per_epoch)
+                eta_sec, sec_per_batch = self.eta.update(
+                    global_step, max(global_step, total_steps_est))
+                if report_now:
+                    step_loss = float(step_loss_tensor.item())
+                    self.progress_fn(epoch=ep, epochs=ep_target, batch=step + 1,
+                                     n_batches=steps_per_epoch, loss=step_loss,
+                                     eta_sec=eta_sec, sec_per_batch=sec_per_batch,
+                                     hparams=self._current_hparams_snapshot())
+                    self._recent_losses.append(step_loss)
+                    if len(self._recent_losses) > 8:
+                        self._recent_losses.pop(0)
+                    if self.config.stop_loss > 0 and len(self._recent_losses) >= 3:
+                        avg3 = sum(self._recent_losses[-3:]) / 3.0
+                        if avg3 <= self.config.stop_loss:
+                            self.log(f"[stop_loss] 3-step avg {avg3:.4f} <= target "
+                                     f"{self.config.stop_loss:.4f} -> stopping training")
+                            self._stop_loss_hit = True
+                            break
 
-                self.progress_fn(epoch=ep, epochs=ep_target, batch=step + 1,
-                                  n_batches=steps_per_epoch, loss=step_loss, eta_sec=eta_sec,
-                                  sec_per_batch=sec_per_batch, hparams=self._current_hparams_snapshot())
-
-                # stop_loss (item 11): compare the RUNNING AVERAGE of the last
-                # >=3 step losses against the target, so a single aberrant low
-                # value can no longer halt training.
-                self._recent_losses.append(step_loss)
-                if len(self._recent_losses) > 8:
-                    self._recent_losses.pop(0)
-                if self.config.stop_loss > 0 and len(self._recent_losses) >= 3:
-                    avg3 = sum(self._recent_losses[-3:]) / 3.0
-                    if avg3 <= self.config.stop_loss:
-                        self.log(f"[stop_loss] 3-step avg {avg3:.4f} <= target "
-                                 f"{self.config.stop_loss:.4f} -> stopping training")
-                        self._stop_loss_hit = True
-                        break
-
-            avg = epoch_loss / max(steps_this_epoch, 1)
+            if optimizer_steps_this_epoch == 0:
+                self.log("[train] no optimizer step completed; leaving epoch/checkpoints unchanged")
+                break
+            avg_sum = float(epoch_loss.item()) if torch.is_tensor(epoch_loss) else float(epoch_loss)
+            avg = avg_sum / max(steps_this_epoch, 1)
             self.loss_history.append(avg)
             self.epoch += 1
-            self.log(f"Epoch {self.epoch} | loss {avg:.4f}")
+            val_loss = self._estimate_validation_loss()
+            val_text = f" | val {val_loss:.4f}" if val_loss is not None else ""
+            self.log(f"Epoch {self.epoch} | train {avg:.4f}{val_text}")
+            if val_loss is not None and val_loss < self.best_val_loss:
+                self.best_val_loss = val_loss
+                self.save_checkpoint(self.epoch, val_loss, best=True)
             if self.epoch % max(1, self.config.save_every) == 0:
                 self.save_checkpoint(self.epoch, avg)
 
+        if self.optimizer is not None:
+            self.optimizer.zero_grad(set_to_none=True)
         self._last_hparams_used = self._current_hparams_snapshot()
-        self.save_checkpoint(self.epoch, self.loss_history[-1] if self.loss_history else float("nan"), final=True)
+        if optimizer_steps_run:
+            self.save_checkpoint(self.epoch, self.loss_history[-1], final=True)
 
         # persist astralis cache alongside the checkpoint (CPU-side, via scratchpad)
         astralis_path = os.path.join(self.config.checkpoint_dir, ASTRALIS_FILENAME)
@@ -4087,7 +4796,17 @@ class Trainer:
         self.log(f"Training complete ({reason}).")
 
     def train(self, corpus_path=None):
+        with self.gen_lock:
+            return self._train_locked(corpus_path)
+
+    def _train_locked(self, corpus_path=None):
         self._stop.clear()
+        self.epoch = 0
+        self.loss_history.clear()
+        self.train_data = None
+        self.val_data = None
+        self.best_val_loss = float("inf")
+        self.ewc = EWCState()
         self._free_model()
         self.log("Building model ...")
         self.build_model()
@@ -4097,10 +4816,15 @@ class Trainer:
         except Exception as e:
             self.log(f"Training error: {e}")
             traceback.print_exc()
-            self.save_checkpoint(self.epoch, self.loss_history[-1] if self.loss_history else float("nan"))
+            if self.epoch > 0 and self.loss_history:
+                self.save_checkpoint(self.epoch, self.loss_history[-1])
             raise
 
     def continue_training(self, new_path=None, extra_epochs=None):
+        with self.gen_lock:
+            return self._continue_training_locked(new_path, extra_epochs)
+
+    def _continue_training_locked(self, new_path=None, extra_epochs=None):
         new_path = new_path or self.config.continue_file or self.config.training_file
         extra_epochs = extra_epochs or self.config.continue_epochs
         self.log(f"[finetune] corpus: {os.path.abspath(new_path)}")
@@ -4109,16 +4833,21 @@ class Trainer:
         if self.model is None:
             self.build_model()
         self._stop.clear()
+        if self.config.ewc_lambda > 0 and self.ewc.fisher is None:
+            if self.train_data is None:
+                self.log("[EWC] no previous corpus/Fisher state available; EWC skipped")
+            else:
+                try:
+                    self.compute_fisher()
+                except Exception as e:
+                    self.log(f"[EWC] Fisher skipped: {e}")
         self._load_corpus(new_path)
-        if self.config.ewc_lambda > 0:
-            try:
-                self.compute_fisher()
-            except Exception as e:
-                self.log(f"[EWC] fisher skipped: {e}")
+        if self.config.ewc_lambda > 0 and self.ewc.fisher is None:
+            self.log("[EWC] fine-tuning without EWC because no prior-task Fisher is available")
         self._train_loop(extra_epochs=extra_epochs)
 
     # ---- checkpoints (now stamps full hyperparams + astralis path for future reload) ----
-    def save_checkpoint(self, epoch, loss, final=False):
+    def save_checkpoint(self, epoch, loss, final=False, best=False):
         if self.model is None:
             return
         # E2 (fix C5): NEVER clobber model_final.pt with a fresh/aborted model
@@ -4128,19 +4857,28 @@ class Trainer:
                      "-- protecting existing model_final.pt")
             return
         os.makedirs(self.config.checkpoint_dir, exist_ok=True)
-        name = "model_final.pt" if final else f"model_epoch_{epoch}.pt"
+        name = ("model_final.pt" if final else "model_best.pt" if best
+            else f"model_epoch_{epoch}.pt")
         path = os.path.join(self.config.checkpoint_dir, name)
         sd = {k: (v.float().cpu() if v.is_floating_point() else v.cpu())
               for k, v in self.model.state_dict().items()}
         cfg = asdict(self.config); cfg.pop("device", None)
+        ewc_state = None
+        if self.ewc.fisher is not None and self.ewc.anchor is not None:
+            ewc_state = {
+                "fisher": {k: v.detach().cpu() for k, v in self.ewc.fisher.items()},
+                "anchor": {k: v.detach().cpu() for k, v in self.ewc.anchor.items()},
+            }
         torch.save({
             "epoch": epoch, "model_state_dict": sd, "encoding_name": self.codec.encoding_name,
             "loss": loss, "config": cfg, "version": "aura-v12",
             "hyperparams_used": self._current_hparams_snapshot(),   # full stamp, per request
             "astralis_file": ASTRALIS_FILENAME,
+            "best_val_loss": self.best_val_loss,
+            "ewc_state": ewc_state,
         }, path)
         self.log(f"checkpoint -> {path}")
-        if not final:
+        if not final and not best:
             # E2: rotation -- keep only the newest N epoch checkpoints
             keep = max(1, int(getattr(self.config, "keep_checkpoints", 5)))
             eps = sorted(glob.glob(os.path.join(self.config.checkpoint_dir, "model_epoch_*.pt")),
@@ -4153,29 +4891,28 @@ class Trainer:
                     pass
 
     def load_checkpoint(self, path, target_n_heads: Optional[int] = None):
-        if self.config.gpu_only_guard:
-            ok, reason = self._gpu_fit_check()
-            if not ok:
-                self.log(f"[GPU only] REFUSING to load: {reason}")
-                raise RuntimeError(f"GPU-only guard blocked checkpoint load: {reason}")
+        with self.gen_lock:
+            return self._load_checkpoint(path, target_n_heads)
 
+    def _load_checkpoint(self, path, target_n_heads: Optional[int] = None):
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
         if not isinstance(ckpt, dict) or "model_state_dict" not in ckpt:
             raise RuntimeError(f"'{os.path.basename(path)}' is not a model checkpoint "
                                f"(no model_state_dict) -- it may be a cache/aux file")
-        cur_dev, cur_dtype, cur_mgpu = self.config.device, self.config.train_dtype, self.config.multi_gpu
-        cur_training_file, cur_continue_file = self.config.training_file, self.config.continue_file
+        cur_dev = self.config.device
         cur_seq = self.config.seq_len
+        cur_n_heads = self.config.n_heads
+        override_seq_len = bool(self.config.override_seq_len_on_load)
+        override_n_heads = bool(self.config.override_n_heads_on_load)
         for k, v in ckpt.get("config", {}).items():
-            if hasattr(self.config, k):
+            if (hasattr(self.config, k)
+                    and k not in ("override_seq_len_on_load", "override_n_heads_on_load")):
                 setattr(self.config, k, v)
-        self.config.device, self.config.train_dtype, self.config.multi_gpu = cur_dev, cur_dtype, cur_mgpu
-        self.config.training_file = cur_training_file
-        self.config.continue_file = cur_continue_file
-        # Dynamic context (item 6): RoPE has no learned position table, so the
-        # user's configured context length wins over the checkpoint's value.
-        if self.config.seq_len != cur_seq:
-            self.log(f"[load] context length: checkpoint={self.config.seq_len} -> using configured {cur_seq}")
+        self.config.device = cur_dev
+        self.config.override_seq_len_on_load = override_seq_len
+        self.config.override_n_heads_on_load = override_n_heads
+        if override_seq_len and self.config.seq_len != cur_seq:
+            self.log(f"[load] context length: checkpoint={self.config.seq_len} -> configured override={cur_seq}")
             self.config.seq_len = cur_seq
         enc = ckpt.get("encoding_name", self.config.encoding)
         gguf_blob = ckpt.get("gguf_tokenizer")
@@ -4204,11 +4941,21 @@ class Trainer:
         if "pos_encoding" not in ckpt.get("config", {}):
             if "wpe.weight" in sd:
                 self.config.pos_encoding = "learned"
-                self.config.seq_len = int(sd["wpe.weight"].shape[0])  # wpe rows fix the context
                 self.log("[load] legacy checkpoint (learned wpe) -> pos_encoding='learned', "
-                         f"RoPE disabled, context={self.config.seq_len} (from wpe table)")
+                         "RoPE disabled")
             else:
                 self.config.pos_encoding = "rope"
+        if "wpe.weight" in sd:
+            old_wpe = sd["wpe.weight"]
+            target_len = max(1, int(self.config.seq_len))
+            if old_wpe.size(0) != target_len:
+                if old_wpe.size(0) > target_len:
+                    sd["wpe.weight"] = old_wpe[:target_len].contiguous()
+                else:
+                    extension = old_wpe[-1:].expand(target_len - old_wpe.size(0), -1)
+                    sd["wpe.weight"] = torch.cat((old_wpe, extension), dim=0)
+                self.log(f"[load] resized legacy learned position table "
+                         f"{old_wpe.size(0)} -> {target_len} rows")
         n_layers, specs = infer_conv_layer_specs(sd, self.config.n_layers)
         if specs:
             first = specs[0]
@@ -4220,9 +4967,21 @@ class Trainer:
                             f"vs checkpoint tensors={tensor_val} -> using {tensor_val}")
                     setattr(self.config, field_name, tensor_val)
 
-        desired_n_heads = target_n_heads or self.config.n_heads
+        loaded_n_heads = self.config.n_heads
+        desired_n_heads = (target_n_heads if target_n_heads is not None else
+                           cur_n_heads if override_n_heads else loaded_n_heads)
+        if desired_n_heads != loaded_n_heads:
+            self.log(f"[load] attention heads: checkpoint={loaded_n_heads} -> configured override={desired_n_heads}")
         self.config.n_heads = desired_n_heads
         self.config.validate()
+        inferred_head_dim, inferred_kv_heads = infer_attention_geometry(
+            sd, n_layers, self.config.n_heads, self.config.d_model,
+            self.config.attn_head_dim, self.config.n_kv_heads, log=self.log)
+        if inferred_head_dim != (self.config.attn_head_dim or
+                                 max(1, self.config.d_model // self.config.n_heads)):
+            self.config.attn_head_dim = inferred_head_dim
+        if inferred_kv_heads != (self.config.n_kv_heads or self.config.n_heads):
+            self.config.n_kv_heads = inferred_kv_heads
         sd = adapt_checkpoint_for_new_n_heads(sd, n_layers, self.config.n_heads, log=self.log)
 
         # q4/q8 fix: bitsandbytes linears store PACKED weights ([N,1] uint8), so
@@ -4241,9 +5000,25 @@ class Trainer:
             self.log(f"[{deferred_dtype}] loading fp32 weights first; quantization "
                      f"is applied AFTER the state dict is in place")
 
+        self._free_model()
+        if self.config.gpu_only_guard:
+            ok, reason = self._gpu_fit_check()
+            if not ok:
+                self.log(f"[GPU only] REFUSING to load: {reason}")
+                raise RuntimeError(f"GPU-only guard blocked checkpoint load: {reason}")
         self.build_model()
         missing, unexpected = self.model.load_state_dict(sd, strict=False)
         self.epoch = ckpt.get("epoch", 0)
+        self.train_data = None
+        self.val_data = None
+        self.best_val_loss = ckpt.get("best_val_loss", float("inf"))
+        ewc_blob = ckpt.get("ewc_state")
+        if isinstance(ewc_blob, dict) and ewc_blob.get("fisher") and ewc_blob.get("anchor"):
+            self.ewc.fisher = {k: v.cpu() for k, v in ewc_blob["fisher"].items()}
+            self.ewc.anchor = {k: v.cpu() for k, v in ewc_blob["anchor"].items()}
+            self.ewc.pin()
+        else:
+            self.ewc = EWCState()
 
         if deferred_dtype is not None:
             self.config.train_dtype = deferred_dtype
@@ -4272,9 +5047,19 @@ class Trainer:
     @torch.no_grad()
     def generate(self, prompt: str, steps=120, temperature=0.8, top_k=50,
                  token_callback=None):
-        # E3: serialize generations -- the UI and the API server share one model.
+        # Training/loading and inference share model weights and module mode.
         with self.gen_lock:
-            return self._generate_inner(prompt, steps, temperature, top_k, token_callback)
+            model = self.model
+            was_training = model.training if model is not None else None
+            try:
+                return self._generate_inner(prompt, steps, temperature, top_k, token_callback)
+            finally:
+                if model is not None and model is self.model:
+                    model.train(was_training)
+                if self.stage == "generating":
+                    self.stage = "idle"
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
     @torch.no_grad()
     def _generate_inner(self, prompt: str, steps=120, temperature=0.8, top_k=50,
@@ -4298,18 +5083,35 @@ class Trainer:
                 cache_hit_text = rec.payload
                 self.log(f"[astralis] cache HIT ({rec.kind}, {rec.hits} hits) -> verbatim shortcut")
 
-        ids = self.codec.encode(prompt) or [198]
+        ids = self.codec.encode(prompt)
+        if isinstance(self.codec, GGUFUnigramCodec):
+            if self.codec.bos_id is not None and (not ids or ids[0] != self.codec.bos_id):
+                ids.insert(0, self.codec.bos_id)
+            if not ids:
+                ids = [self.codec.unk_id if self.codec.unk_id is not None else 0]
+        else:
+            ids = ids or [198]
         if len(ids) > self.model.block_size:
-            ids = ids[-self.model.block_size:]
+            context_limit = self.model.block_size
+            separator = self.codec.encode("\n")
+            if context_limit > len(separator) + 1:
+                head_size = max(1, (context_limit - len(separator)) // 4)
+                tail_size = context_limit - head_size - len(separator)
+                ids = ids[:head_size] + separator + ids[-tail_size:]
+            else:
+                ids = ids[-context_limit:]
         idx = torch.tensor([ids], dtype=torch.long, device=self.config.device)
 
         if cache_hit_text is not None:
+            gen_ids = self.codec.encode(cache_hit_text)[:max(0, int(steps))]
+            cache_hit_text = self.codec.decode(gen_ids)
+            if self.config.finish_sentence:
+                cache_hit_text = trim_to_sentence_end(cache_hit_text)
             if token_callback is not None:
                 try:
                     token_callback(cache_hit_text)
                 except Exception:
                     pass
-            gen_ids = self.codec.encode(cache_hit_text)[:steps]
             elapsed = max(time.perf_counter() - t0, 1e-9)
             self.stage = "idle"
             return cache_hit_text, len(gen_ids) / elapsed, elapsed, True
@@ -4324,8 +5126,10 @@ class Trainer:
             out, n_gen = self.model.generate(
                 idx, max_new_tokens=steps, temperature=temperature, top_k=top_k,
                 stop_token_ids=stop_ids, finish_sentence=self.config.finish_sentence,
-                finish_extra_tokens=max(0, int(getattr(self.config, "finish_max_extra", 40))),
-                decode_fn=self.codec.decode, token_callback=token_callback)
+                finish_extra_tokens=max(0, int(getattr(self.config, "finish_max_extra", 128))),
+                decode_fn=(self.codec.decode if token_callback is not None
+                           or self.config.finish_sentence else None),
+                token_callback=token_callback)
         gen = out[0, len(ids):].tolist()
         text = self.codec.decode(gen)
         if self.config.finish_sentence:
@@ -4419,10 +5223,10 @@ class _APIHandler(http.server.BaseHTTPRequestHandler):
                 if role == "system":
                     parts.append(content)
                 elif role == "assistant":
-                    parts.append(f"{cfg.assistant_name}: {content}")
+                    parts.append(f"{cfg.speaker_identity or cfg.assistant_name}: {content}")
                 else:
                     parts.append(f"{cfg.user_name}: {content}")
-            parts.append(f"{cfg.assistant_name}:")
+            parts.append(f"{cfg.speaker_identity or cfg.assistant_name}:")
             self._complete(payload, "\n".join(parts), chat_format=True)
         elif path == "/v1/completions":
             self._complete(payload, str(payload.get("prompt", "")), chat_format=False)
@@ -4433,6 +5237,8 @@ class _APIHandler(http.server.BaseHTTPRequestHandler):
         trainer, cfg = self.server.trainer, self.server.cfg
         steps = int(payload.get("max_tokens") or cfg.gen_steps)
         temp = float(payload.get("temperature") or cfg.temperature)
+        requested_top_k = payload.get("top_k", cfg.top_k)
+        top_k = cfg.top_k if requested_top_k is None else int(requested_top_k)
         stream = bool(payload.get("stream", False))
         rid = f"chatcmpl-{int(time.time() * 1000)}"
         obj = "chat.completion" if chat_format else "text_completion"
@@ -4463,7 +5269,7 @@ class _APIHandler(http.server.BaseHTTPRequestHandler):
                     except Exception:
                         pass
                 text, tps, el, _hit = trainer.generate(prompt, steps=steps, temperature=temp,
-                                                       top_k=cfg.top_k, token_callback=cb)
+                                                       top_k=top_k, token_callback=cb)
                 done_choice = ({"index": 0, "delta": {}, "finish_reason": "stop"} if chat_format
                                else {"index": 0, "text": "", "finish_reason": "stop"})
                 done = {"id": rid, "object": obj + ".chunk", "created": int(time.time()),
@@ -4476,7 +5282,7 @@ class _APIHandler(http.server.BaseHTTPRequestHandler):
                 GLOBAL_LOGGER.log(f"[api] stream complete ({len(text)} chars, {tps:.1f} tok/s)")
                 return
             text, tps, el, _hit = trainer.generate(prompt, steps=steps, temperature=temp,
-                                                   top_k=cfg.top_k)
+                                                   top_k=top_k)
         except Exception as e:
             GLOBAL_LOGGER.log(f"[api] generation error: {e}")
             self._json(500, {"error": {"message": str(e)}})
@@ -4751,17 +5557,28 @@ class TextBox:
         self.sel_anchor = None
         return True
 
+    def _visible_window(self, font):
+        max_width = max(1, self.rect.width - 12)
+        cursor = max(0, min(self.cursor, len(self.value)))
+        start = cursor
+        while start > 0 and font.size(self.value[start - 1:cursor])[0] <= max_width:
+            start -= 1
+        end = cursor
+        while end < len(self.value) and font.size(self.value[start:end + 1])[0] <= max_width:
+            end += 1
+        return start, end
+
     def _char_index_at_x(self, font, px_x: int) -> int:
         rel = px_x - (self.rect.x + 6)
-        disp = self.value if len(self.value) < 60 else "…" + self.value[-59:]
+        start, end = self._visible_window(font)
+        disp = self.value[start:end]
         best_i, best_d = 0, float("inf")
         for i in range(len(disp) + 1):
             w = font.size(disp[:i])[0]
             d = abs(w - rel)
             if d < best_d:
                 best_d, best_i = d, i
-        offset = 0 if len(self.value) < 60 else max(0, len(self.value) - 59)
-        return min(len(self.value), offset + best_i)
+        return min(len(self.value), start + best_i)
 
     def handle_event(self, event, font=None):
         if event.type == pygame.MOUSEBUTTONDOWN and self.rect.collidepoint(event.pos):
@@ -4771,10 +5588,19 @@ class TextBox:
                 self._click_times = [t for t in self._click_times if now - t < 0.6]
                 self._click_times.append(now)
                 if len(self._click_times) >= 3:
-                    self.value = ""
-                    self.cursor = 0
-                    self.sel_anchor = None
+                    self.sel_anchor, self.cursor = 0, len(self.value)
+                    self._dragging = False
                     self._click_times.clear()
+                elif len(self._click_times) == 2:
+                    self.cursor = self._char_index_at_x(font, event.pos[0]) if font is not None else self.cursor
+                    start = self.cursor
+                    end = self.cursor
+                    while start > 0 and not self.value[start - 1].isspace():
+                        start -= 1
+                    while end < len(self.value) and not self.value[end].isspace():
+                        end += 1
+                    self.sel_anchor, self.cursor = start, end
+                    self._dragging = False
                 else:
                     if font is not None:
                         self.cursor = self._char_index_at_x(font, event.pos[0])
@@ -4813,7 +5639,8 @@ class TextBox:
                     if self.numeric:
                         txt = "".join(c for c in txt if c in "0123456789.-e")
                     self._delete_selection()
-                    self.value = _sanitize(self.value[:self.cursor] + txt + self.value[self.cursor:])
+                    txt = _sanitize(txt)
+                    self.value = self.value[:self.cursor] + txt + self.value[self.cursor:]
                     self.cursor += len(txt)
             elif ctrl and event.key == pygame.K_c:
                 sel = self._sel_range()
@@ -4831,18 +5658,49 @@ class TextBox:
                 if not self._delete_selection():
                     self.value = self.value[:self.cursor] + self.value[self.cursor + 1:]
             elif event.key == pygame.K_LEFT:
-                new_cursor = max(0, self.cursor - 1)
+                sel = self._sel_range()
+                if sel and not shift:
+                    self.cursor = sel[0]
+                    self.sel_anchor = None
+                else:
+                    if shift and self.sel_anchor is None:
+                        self.sel_anchor = self.cursor
+                    elif not shift:
+                        self.sel_anchor = None
+                    if ctrl:
+                        while self.cursor > 0 and self.value[self.cursor - 1].isspace():
+                            self.cursor -= 1
+                        while self.cursor > 0 and not self.value[self.cursor - 1].isspace():
+                            self.cursor -= 1
+                    else:
+                        self.cursor = max(0, self.cursor - 1)
+            elif event.key == pygame.K_RIGHT:
+                sel = self._sel_range()
+                if sel and not shift:
+                    self.cursor = sel[1]
+                    self.sel_anchor = None
+                else:
+                    if shift and self.sel_anchor is None:
+                        self.sel_anchor = self.cursor
+                    elif not shift:
+                        self.sel_anchor = None
+                    if ctrl:
+                        while self.cursor < len(self.value) and not self.value[self.cursor].isspace():
+                            self.cursor += 1
+                        while self.cursor < len(self.value) and self.value[self.cursor].isspace():
+                            self.cursor += 1
+                    else:
+                        self.cursor = min(len(self.value), self.cursor + 1)
+            elif event.key == pygame.K_HOME:
                 self.sel_anchor = self.sel_anchor if shift else None
                 if shift and self.sel_anchor is None:
                     self.sel_anchor = self.cursor
-                self.cursor = new_cursor
-            elif event.key == pygame.K_RIGHT:
-                new_cursor = min(len(self.value), self.cursor + 1)
+                self.cursor = 0
+            elif event.key == pygame.K_END:
+                self.sel_anchor = self.sel_anchor if shift else None
                 if shift and self.sel_anchor is None:
                     self.sel_anchor = self.cursor
-                elif not shift:
-                    self.sel_anchor = None
-                self.cursor = new_cursor
+                self.cursor = len(self.value)
             elif event.key in (pygame.K_RETURN, pygame.K_TAB):
                 self.active = False
                 self.sel_anchor = None
@@ -4859,22 +5717,23 @@ class TextBox:
             draw_round_rect_glow(surf, colors["accent"], self.rect, 6, glow_alpha=35)
         border_c = colors["accent"] if self.active else colors["border"]
         draw_round_rect(surf, border_c, self.rect, 8, width=1)
-        disp = self.value if len(self.value) < 60 else "…" + self.value[-59:]
-        offset = 0 if len(self.value) < 60 else max(0, len(self.value) - 59)
+        start, end = self._visible_window(font)
+        disp = self.value[start:end]
 
         sel = self._sel_range()
         if sel:
-            lo = max(0, sel[0] - offset)
-            hi = max(0, sel[1] - offset)
+            lo = max(0, max(sel[0], start) - start)
+            hi = max(0, min(sel[1], end) - start)
             x0 = self.rect.x + 6 + font.size(disp[:lo])[0]
             x1 = self.rect.x + 6 + font.size(disp[:hi])[0]
-            sel_rect = pygame.Rect(x0, self.rect.y + 4, max(1, x1 - x0), self.rect.height - 8)
-            draw_round_rect(surf, (*colors["accent"], 90) if len(colors["accent"]) == 3 else colors["accent"], sel_rect, 2)
+            if hi > lo:
+                sel_rect = pygame.Rect(x0, self.rect.y + 4, max(1, x1 - x0), self.rect.height - 8)
+                draw_round_rect(surf, (*colors["accent"], 90) if len(colors["accent"]) == 3 else colors["accent"], sel_rect, 2)
 
         _render_emoji_text(surf, (self.rect.x + 6, self.rect.centery - font.get_height() // 2), disp,
                            font, colors["text"], emoji_font)
         if self.active and int(time.time() * 2) % 2 == 0:
-            cur_disp = max(0, self.cursor - offset)
+            cur_disp = max(0, min(len(disp), self.cursor - start))
             cx = self.rect.x + 6 + font.size(disp[:min(cur_disp, len(disp))])[0]
             pygame.draw.line(surf, colors["text"], (cx, self.rect.y + 4), (cx, self.rect.bottom - 4), 1)
 
@@ -4920,16 +5779,22 @@ class MultilineTextBox:
             if para == "":
                 lines.append(("", idx))
             else:
-                cur, cur_start = "", idx
-                for w in para.split(" "):
-                    trial = (cur + " " + w) if cur else w
-                    if font.size(trial)[0] > max_w and cur:
-                        lines.append((cur, cur_start))
-                        cur_start = cur_start + len(cur) + 1
-                        cur = w
-                    else:
-                        cur = trial
-                lines.append((cur, cur_start))
+                start = 0
+                while start < len(para):
+                    end, last_space = start, None
+                    while end < len(para) and font.size(para[start:end + 1])[0] <= max_w:
+                        if para[end].isspace():
+                            last_space = end
+                        end += 1
+                    if end == len(para):
+                        lines.append((para[start:end], idx + start))
+                        break
+                    if end == start:
+                        end += 1
+                    elif last_space is not None and last_space >= start:
+                        end = last_space + 1
+                    lines.append((para[start:end], idx + start))
+                    start = end
             idx += len(para) + 1
         return lines or [("", 0)]
 
@@ -4970,10 +5835,19 @@ class MultilineTextBox:
                 self._click_times = [t for t in self._click_times if now - t < 0.6]
                 self._click_times.append(now)
                 if len(self._click_times) >= 3:
-                    self.text = ""
-                    self.cursor = 0
-                    self.sel_anchor = None
+                    self.sel_anchor, self.cursor = 0, len(self.text)
+                    self._dragging = False
                     self._click_times.clear()
+                elif len(self._click_times) == 2:
+                    self.cursor = self._index_at(font, event.pos) if font is not None else self.cursor
+                    start = self.cursor
+                    end = self.cursor
+                    while start > 0 and not self.text[start - 1].isspace():
+                        start -= 1
+                    while end < len(self.text) and not self.text[end].isspace():
+                        end += 1
+                    self.sel_anchor, self.cursor = start, end
+                    self._dragging = False
                 else:
                     # item 17: click places the caret at the true position
                     self.cursor = self._index_at(font, event.pos) if font is not None else len(self.text)
@@ -5007,7 +5881,8 @@ class MultilineTextBox:
                 txt = get_clipboard()
                 if txt:
                     self._delete_selection()
-                    self.text = _sanitize(self.text[:self.cursor] + txt + self.text[self.cursor:])
+                    txt = _sanitize(txt)
+                    self.text = self.text[:self.cursor] + txt + self.text[self.cursor:]
                     self.cursor += len(txt)
             elif ctrl and event.key == pygame.K_c:
                 sel = self._sel_range()
@@ -5029,22 +5904,55 @@ class MultilineTextBox:
                 if not self._delete_selection():
                     self.text = self.text[:self.cursor] + self.text[self.cursor + 1:]
             elif event.key == pygame.K_LEFT:
-                if shift and self.sel_anchor is None:
-                    self.sel_anchor = self.cursor
-                elif not shift:
+                sel = self._sel_range()
+                if sel and not shift:
+                    self.cursor = sel[0]
                     self.sel_anchor = None
-                self.cursor = max(0, self.cursor - 1)
+                else:
+                    if shift and self.sel_anchor is None:
+                        self.sel_anchor = self.cursor
+                    elif not shift:
+                        self.sel_anchor = None
+                    if ctrl:
+                        while self.cursor > 0 and self.text[self.cursor - 1].isspace():
+                            self.cursor -= 1
+                        while self.cursor > 0 and not self.text[self.cursor - 1].isspace():
+                            self.cursor -= 1
+                    else:
+                        self.cursor = max(0, self.cursor - 1)
             elif event.key == pygame.K_RIGHT:
+                sel = self._sel_range()
+                if sel and not shift:
+                    self.cursor = sel[1]
+                    self.sel_anchor = None
+                else:
+                    if shift and self.sel_anchor is None:
+                        self.sel_anchor = self.cursor
+                    elif not shift:
+                        self.sel_anchor = None
+                    if ctrl:
+                        while self.cursor < len(self.text) and not self.text[self.cursor].isspace():
+                            self.cursor += 1
+                        while self.cursor < len(self.text) and self.text[self.cursor].isspace():
+                            self.cursor += 1
+                    else:
+                        self.cursor = min(len(self.text), self.cursor + 1)
+            elif event.key in (pygame.K_HOME, pygame.K_END) and font is not None:
+                li, _col = self._caret_line_col(font)
+                lines = self._wrap_indexed(font, self.rect.width - 16)
+                line_text, line_start = lines[li]
                 if shift and self.sel_anchor is None:
                     self.sel_anchor = self.cursor
                 elif not shift:
                     self.sel_anchor = None
-                self.cursor = min(len(self.text), self.cursor + 1)
+                self.cursor = line_start if event.key == pygame.K_HOME else line_start + len(line_text)
             elif event.key in (pygame.K_UP, pygame.K_DOWN) and font is not None:
                 li, col = self._caret_line_col(font)
                 lines = self._wrap_indexed(font, self.rect.width - 16)
                 li2 = max(0, min(len(lines) - 1, li + (1 if event.key == pygame.K_DOWN else -1)))
                 text2, start2 = lines[li2]
+                if shift and self.sel_anchor is None:
+                    self.sel_anchor = self.cursor
                 self.cursor = start2 + min(col, len(text2))
                 if not shift:
                     self.sel_anchor = None
@@ -5077,7 +5985,7 @@ class MultilineTextBox:
             return
         y = self.rect.y + 7
         clip = surf.get_clip()
-        surf.set_clip(self.rect.inflate(-4, -4))
+        surf.set_clip(clip.clip(self.rect.inflate(-4, -4)))
         sel = self._sel_range()
         for text, start in lines[self.scroll_line:self.scroll_line + self.visible_lines + 1]:
             if sel:
@@ -5592,9 +6500,13 @@ class ChatPanel:
             if y + bh < self.rect.y or y > self.rect.bottom:
                 y += bh + 8
                 continue
-            is_user, is_warn = turn["role"] == "user", turn["role"] == "warning"
+            is_user = turn["role"] == "user"
+            is_error = turn["role"] == "error"
+            is_warn = turn["role"] == "warning"
             if is_warn:
                 bx, bc, ec = self.rect.x + pad, colors["warn_bubble"], colors["warn"]
+            elif is_error:
+                bx, bc, ec = self.rect.x + pad, colors["warn_bubble"], colors["danger"]
             elif is_user:
                 bx = self.rect.right - pad - bw - (bubble_margin - 10)
                 bc, ec = colors["user_bubble"], colors["user_border"]
@@ -5606,7 +6518,7 @@ class ChatPanel:
             draw_round_rect_glow(surf, ec, br, 13, 16)
             draw_vertical_gradient(surf, br, bc, colors["panel_deep"], 13)
             draw_round_rect(surf, ec, br, 13, width=1)
-            tc = colors["warn"] if is_warn else colors["text"]
+            tc = colors["warn"] if is_warn else colors["danger"] if is_error else colors["text"]
             ty, tx = y + 8, bx + 8
             list_counters: Dict[int, int] = {}
 
@@ -5816,6 +6728,7 @@ def gui_main():
     settings_mgr = SettingsManager(CONFIG_PATH)
     cfg = load_or_create_config(settings_mgr)
     cfg.validate()
+    chrome.set_opacity(cfg.gui_window_opacity)
 
     monitor = ResourceMonitor()
     monitor.start()
@@ -5827,11 +6740,16 @@ def gui_main():
     state = {
         "status": "idle", "epoch": 0, "epochs": cfg.epochs, "batch": 0, "n_batches": 0,
         "loss": None, "eta_sec": None, "sec_per_batch": None, "error": None,
-        "convert_open": False, "settings_scroll_px": 0, "hparams": {}, "loaded_ckpt_path": "",
+        "error_seq": 0, "convert_open": False, "settings_scroll_px": 0,
+        "hparams": {}, "loaded_ckpt_path": "",
     }
 
     def log_fn(msg):
         GLOBAL_LOGGER.log(msg)
+
+    def report_gui_error(message):
+        state["error"] = str(message)
+        state["error_seq"] += 1
 
     loss_hist: List[float] = []   # item 20: per-step loss series for the chart
 
@@ -5852,7 +6770,10 @@ def gui_main():
     def predicted_vram_text() -> str:
         key = (cfg.d_model, cfg.n_layers, cfg.n_heads, cfg.kernel_size, cfg.seq_len,
                cfg.batch_size, cfg.train_dtype, cfg.grad_checkpoint,
-               cfg.use_transformer_attention, trainer.codec.vocab_size)
+               cfg.use_transformer_attention, cfg.model_mode, cfg.attention_every_n_layers,
+               cfg.pos_encoding, cfg.ff_dim, cfg.attn_head_dim, cfg.n_kv_heads,
+               cfg.qk_norm, cfg.gated_mlp, cfg.untie_head, cfg.norm_type,
+               cfg.loss_fn, trainer.codec.vocab_size)
         if key != vram_pred_cache["key"]:
             try:
                 p = predict_vram_usage(cfg, trainer.codec.vocab_size)
@@ -5886,11 +6807,15 @@ def gui_main():
             monitor.begin_reporting()
             trainer.load_checkpoint(ck)
             state["loaded_ckpt_path"] = ck
+            state["epochs"] = cfg.epochs
+            state["hparams"] = trainer._last_hparams_used or {}
             log_fn(f"auto-loaded {ck}")
         except Exception as e:
             log_fn(f"checkpoint load failed: {e}")
+            report_gui_error(e)
 
     train_thread = [None]
+    pending_model_action = [None]
 
     def is_busy():
         # FIX: also treat "stopping" and any live background thread as busy so
@@ -5899,7 +6824,7 @@ def gui_main():
                 or (train_thread[0] is not None and train_thread[0].is_alive()))
 
     def start_training():
-        if is_busy():
+        if is_busy() or pending_model_action[0] is not None:
             log_fn("already training")
             return
         state["error"] = None
@@ -5911,7 +6836,7 @@ def gui_main():
                 trainer.train(cfg.training_file)
                 state["status"] = "done"
             except Exception as e:
-                state["error"] = str(e)
+                report_gui_error(e)
                 state["status"] = "error"
         train_thread[0] = threading.Thread(target=run, daemon=True)
         train_thread[0].start()
@@ -5932,7 +6857,7 @@ def gui_main():
             trainer.pause(); state["status"] = "paused"
 
     def start_finetune():
-        if is_busy():
+        if is_busy() or pending_model_action[0] is not None:
             log_fn("stop current run first")
             return
         monitor.begin_reporting()
@@ -5943,57 +6868,45 @@ def gui_main():
                 trainer.continue_training(cfg.continue_file, cfg.continue_epochs)
                 state["status"] = "done"
             except Exception as e:
-                state["error"] = str(e)
+                report_gui_error(e)
                 state["status"] = "error"
         train_thread[0] = threading.Thread(target=run, daemon=True)
         train_thread[0].start()
 
     def load_ckpt():
-        # Allowed at any point: if a train is running, request clean stop first,
-        # wait briefly for the thread to exit, clear memory, then load.
         ck2 = find_latest_checkpoint(cfg.checkpoint_dir)
         if not ck2:
             log_fn("no checkpoint found")
             return
 
         def _do():
-            if is_busy():
-                log_fn("[load] stopping current run before load ...")
-                trainer.stop()
-                # wait up to ~4 s for the train thread to finish
-                t0 = time.time()
-                while train_thread[0] is not None and train_thread[0].is_alive() and time.time() - t0 < 4.0:
-                    time.sleep(0.05)
-                state["status"] = "idle"
             state["status"] = "loading"
             monitor.begin_reporting()
             try:
                 trainer.load_checkpoint(ck2)
                 state["loaded_ckpt_path"] = ck2
-                # Push restored hyperparams into the live settings widgets so the
-                # panel tells the truth about what is actually loaded.
-                for k, w in settings_fields.items():
-                    if not hasattr(cfg, k):
-                        continue
-                    v = getattr(cfg, k)
-                    if isinstance(w, (Checkbox, Dropdown)):
-                        w.value = v
-                    elif isinstance(w, MultilineTextBox):
-                        w.text = _sanitize(str(v))
-                    else:
-                        try:
-                            w.value = str(v)
-                        except Exception:
-                            pass
+                sync_widgets_from_config()
+                state["epochs"] = cfg.epochs
+                state["hparams"] = trainer._last_hparams_used or {}
+                mark_settings_dirty()
                 log_fn(f"loaded {ck2}  (n_heads={cfg.n_heads}, dtype={cfg.train_dtype}, "
                        f"d_model={cfg.d_model}, L={cfg.n_layers}, kernel={cfg.kernel_size})")
                 state["status"] = "idle"
             except Exception as e:
                 log_fn(f"load failed: {e}")
                 state["status"] = "error"
-                state["error"] = str(e)
-        train_thread[0] = threading.Thread(target=_do, daemon=True)
-        train_thread[0].start()
+                report_gui_error(e)
+
+        def _launch():
+            state["status"] = "loading"
+            train_thread[0] = threading.Thread(target=_do, daemon=True)
+            train_thread[0].start()
+
+        if is_busy():
+            pending_model_action[0] = _launch
+            log_fn("[load] queued until training finishes; training continues uninterrupted")
+        else:
+            _launch()
 
     def save_ckpt():
         trainer.save_checkpoint(trainer.epoch, trainer.loss_history[-1] if trainer.loss_history else float("nan"))
@@ -6005,6 +6918,25 @@ def gui_main():
     def toggle_convert():
         state["convert_open"] = not state["convert_open"]
 
+    def sync_widgets_from_config():
+        for key, widget in settings_fields.items():
+            value = getattr(cfg, key)
+            if isinstance(widget, (Checkbox, Dropdown)):
+                widget.value = value
+            elif isinstance(widget, MultilineTextBox):
+                widget.text = _sanitize(str(value))
+            else:
+                widget.value = str(value)
+        for key, box in (("gen_steps", gen_steps_box), ("temperature", gen_temp_box),
+                         ("top_k", gen_topk_box)):
+            box.value = str(getattr(cfg, key))
+        meta_gen_cb.value = cfg.meta_generate
+        recent_cb.value = cfg.send_only_recent
+        parse_md_cb.value = cfg.parse_markdown
+        finish_sentence_cb.value = cfg.finish_sentence
+        gpu_only_cb.value = cfg.gpu_only_guard
+        state["epochs"] = cfg.epochs
+
     def do_convert():
         if is_busy():
             log_fn("busy — stop current run first")
@@ -6013,35 +6945,36 @@ def gui_main():
         opath = conv_out_box.value.strip() or "aura_from_gguf.pth"
         if not gpath or not os.path.exists(gpath):
             log_fn(f"GGUF file not found: {gpath}")
+            report_gui_error(f"GGUF file not found: {gpath}")
             return
         try:
-            conv_cfg = Config(d_model=int(float(conv_dm_box.value)), n_layers=int(float(conv_nl_box.value)),
-                               n_heads=int(float(conv_nh_box.value)), kernel_size=int(float(conv_ks_box.value)),
-                               seq_len=cfg.seq_len, encoding=cfg.encoding, dropout=cfg.dropout)
+            conv_cfg = Config(**asdict(cfg))
+            conv_cfg.d_model = int(float(conv_dm_box.value))
+            conv_cfg.n_layers = int(float(conv_nl_box.value))
+            conv_cfg.n_heads = int(float(conv_nh_box.value))
+            conv_cfg.kernel_size = int(float(conv_ks_box.value))
             conv_cfg.validate()
         except Exception as e:
             log_fn(f"config error: {e}")
+            report_gui_error(e)
             return
 
         def run():
-            state["status"] = "loading"
             try:
                 convert_gguf_to_aura(gpath, opath, conv_cfg, log=log_fn)
                 monitor.begin_reporting()
                 trainer.load_checkpoint(opath)
                 state["loaded_ckpt_path"] = opath
-                # Sync the UI config with trainer's updated config (encoding, model_mode, etc.)
-                for k, v in asdict(trainer.config).items():
-                    if hasattr(cfg, k):
-                        setattr(cfg, k, v)
                 cfg.validate()
+                sync_widgets_from_config()
                 mark_settings_dirty()
                 log_fn("converted model loaded")
                 state["status"] = "idle"
             except Exception as e:
                 log_fn(f"GGUF ERROR: {e}")
                 state["status"] = "error"
-                state["error"] = str(e)
+                report_gui_error(e)
+        state["status"] = "loading"
         train_thread[0] = threading.Thread(target=run, daemon=True)
         train_thread[0].start()
         state["convert_open"] = False
@@ -6088,6 +7021,10 @@ def gui_main():
                 settings_fields[k] = Dropdown((SETTINGS_X, y_cursor + FIELD_LABEL_HEIGHT + 6, 130, 26), TRAIN_DTYPE_OPTIONS, cur)
             elif k == "encoding":
                 settings_fields[k] = Dropdown((SETTINGS_X, y_cursor + FIELD_LABEL_HEIGHT + 6, 150, 26), ENCODING_OPTIONS, cur)
+            elif k == "norm_type":
+                settings_fields[k] = Dropdown((SETTINGS_X, y_cursor + FIELD_LABEL_HEIGHT + 6, 150, 26), NORM_TYPE_OPTIONS, cur)
+            elif k == "mlp_activation":
+                settings_fields[k] = Dropdown((SETTINGS_X, y_cursor + FIELD_LABEL_HEIGHT + 6, 150, 26), MLP_ACTIVATION_OPTIONS, cur)
             elif k == "loss_fn":
                 settings_fields[k] = Dropdown((SETTINGS_X, y_cursor + FIELD_LABEL_HEIGHT + 6, 190, 26), LOSS_FN_OPTIONS, cur)
             elif k == "meta_scratchpad_mode":
@@ -6112,11 +7049,15 @@ def gui_main():
     STRUCTURAL_KEYS = {"d_model", "n_layers", "n_heads", "kernel_size",
                        "use_transformer_attention", "train_dtype", "encoding",
                        "seq_len", "batch_size", "multi_gpu", "pos_encoding",
-                       "model_mode"}
+                       "model_mode", "attention_every_n_layers", "norm_type",
+                       "norm_eps", "mlp_activation", "attn_head_dim", "n_kv_heads",
+                       "qk_norm", "gated_mlp", "ff_dim", "untie_head"}
 
     SETTINGS_CONTENT_H = y_cursor + 10
 
     def apply_field_values():
+        if state["status"] == "loading":
+            return
         changed = False
         # Item 10: lr, system prompt, epochs, save_every, keep_checkpoints and
         # loss_fn apply LIVE mid-training; STRUCTURAL fields are locked while a
@@ -6175,6 +7116,7 @@ def gui_main():
         target_bytes = int(cfg.astralis_max_kb * 1024)
         if target_bytes != trainer.astralis.max_bytes:
             trainer.astralis.max_bytes = target_bytes
+        chrome.set_opacity(cfg.gui_window_opacity)
 
     _ext_poll = {"t": 0.0}
 
@@ -6184,6 +7126,8 @@ def gui_main():
         is actively focused (so a second app instance can't yank a value out from
         under an in-progress edit). Item 15: disk is polled at most once/second
         instead of at 60 fps."""
+        if state["status"] == "loading":
+            return
         now = time.time()
         if now - _ext_poll["t"] < 1.0:
             return
@@ -6230,7 +7174,7 @@ def gui_main():
         Button((358, 90, 118, 32), "Clear chat", lambda: chat.clear(), COLORS["purple"]),
     ]
 
-    PROG_Y, PROG_H = 132, 100
+    PROG_Y, PROG_H = 132, 116
     CHARTS_H = 104
     SETTINGS_TOP = PROG_Y + PROG_H + CHARTS_H + 22
     FOOTER_H = 168                             # checkboxes + finetune btn + gguf btn, static
@@ -6269,17 +7213,34 @@ def gui_main():
     gen_topk_box = TextBox((RIGHT_X + 184, GEN_ROW_Y, 80, 26), value=str(cfg.top_k), numeric=True, label="top_k")
     meta_gen_cb = Checkbox(RIGHT_X + 276, GEN_ROW_Y + 4, "meta_generate", cfg.meta_generate)
 
-    def unload_model():
-        """Item 14: unload the model from memory, freeing VRAM/RAM immediately."""
-        if is_busy():
-            log_fn("[unload] training in progress -- stop it first")
-            return
+    def _unload_model_now():
         if trainer.model is None:
             log_fn("[unload] no model loaded")
             return
-        trainer._free_model()
+        with trainer.gen_lock:
+            trainer._free_model()
         state["loaded_ckpt_path"] = ""
         log_fn("[unload] model unloaded from memory; VRAM/RAM released")
+
+    def unload_model():
+        """Unload after any active training run, without stopping that run."""
+        def _launch():
+            def _do_unload():
+                state["status"] = "loading"
+                try:
+                    _unload_model_now()
+                    state["status"] = "idle"
+                except Exception as e:
+                    state["status"] = "error"
+                    report_gui_error(e)
+            train_thread[0] = threading.Thread(target=_do_unload, daemon=True)
+            train_thread[0].start()
+
+        if is_busy():
+            pending_model_action[0] = _launch
+            log_fn("[unload] queued until training finishes; training continues uninterrupted")
+            return
+        _launch()
 
     unload_btn = Button((RIGHT_X + 430, GEN_ROW_Y, 150, 28), "Unload model", unload_model, COLORS["danger"])
 
@@ -6306,6 +7267,7 @@ def gui_main():
     CONSOLE_H = 136
     CHAT_BOTTOM_MARGIN = PROMPT_H + SEND_H + CONSOLE_H + 30
     chat = ChatPanel((RIGHT_X, CHAT_TOP, RIGHT_W, H - CHAT_TOP - CHAT_BOTTOM_MARGIN - 6))
+    last_chat_error_seq = [0]
 
     prompt_box = MultilineTextBox((RIGHT_X, H - CONSOLE_H - PROMPT_H - SEND_H - 22, RIGHT_W - 94, PROMPT_H), visible_lines=3)
     play_btn = SmallIconButton((RIGHT_X + RIGHT_W - 82, H - CONSOLE_H - PROMPT_H - SEND_H - 22, 72, PROMPT_H), None, COLORS["accent"])
@@ -6327,9 +7289,9 @@ def gui_main():
                 if t["role"] == "user":
                     parts.append(f"{cfg.user_name}: {t['text']}")
                 elif t["role"] == "model":
-                    parts.append(f"{cfg.assistant_name}: {t['text']}")
+                    parts.append(f"{cfg.speaker_identity or cfg.assistant_name}: {t['text']}")
         parts.append(f"{cfg.user_name}: {prompt}")
-        parts.append(f"{cfg.assistant_name}:")
+        parts.append(f"{cfg.speaker_identity or cfg.assistant_name}:")
         return "\n".join(parts)
 
     def _run_generation(full_prompt, is_continue=False):
@@ -6386,8 +7348,8 @@ def gui_main():
             if t["role"] == "user":
                 parts.append(f"{cfg.user_name}: {t['text']}")
             elif t["role"] == "model":
-                parts.append(f"{cfg.assistant_name}: {t['text']}")
-        seed = "\n".join(parts) if parts else f"{cfg.assistant_name}:"
+                parts.append(f"{cfg.speaker_identity or cfg.assistant_name}: {t['text']}")
+        seed = "\n".join(parts) if parts else f"{cfg.speaker_identity or cfg.assistant_name}:"
         _run_generation(seed, is_continue=True)
 
     send_btn.action = do_send
@@ -6473,6 +7435,15 @@ def gui_main():
                             max(0, SETTINGS_CONTENT_H - SETTINGS_VIEWPORT_H)))
                         scroll_thumb.set_from_scroll(state["settings_scroll_px"], SETTINGS_CONTENT_H, SETTINGS_VIEWPORT_H)
             elif event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 1:
+                    text_widgets = list(settings_fields.values()) + [
+                        prompt_box, gen_steps_box, gen_temp_box, gen_topk_box,
+                        conv_gguf_box, conv_out_box, conv_dm_box, conv_nl_box,
+                        conv_nh_box, conv_ks_box]
+                    for widget in text_widgets:
+                        if isinstance(widget, (TextBox, MultilineTextBox)) and not widget.rect.collidepoint(event.pos):
+                            widget.active = False
+                            widget._dragging = False
                 if state["convert_open"]:
                     for w in (conv_gguf_box, conv_out_box, conv_dm_box, conv_nl_box, conv_nh_box, conv_ks_box):
                         w.handle_event(event, font=font_small)
@@ -6525,16 +7496,27 @@ def gui_main():
                                                               gen_steps_box, gen_temp_box, gen_topk_box]:
                     if isinstance(w, TextBox):
                         w.handle_event(event, font=font_small)
+                    elif isinstance(w, MultilineTextBox):
+                        w.handle_event(event, False, lambda: None, font=font_small)
                 prompt_box.handle_event(event, True, do_send, font=font)
                 chat.handle_scrollbar_event(event)
                 nc = scroll_thumb.handle_event(event, SETTINGS_CONTENT_H, SETTINGS_VIEWPORT_H)
                 if nc is not None:
                     state["settings_scroll_px"] = nc
             elif event.type == pygame.MOUSEMOTION:
-                # PERF: only forward to TextBox widgets that are dragging (active + mouse down)
+                # Only active/dragging fields need pointer motion for selection.
                 for w in settings_fields.values():
-                    if isinstance(w, TextBox) and (w.active or getattr(w, '_dragging', False)):
-                        w.handle_event(event, font=font_small)
+                    if isinstance(w, (TextBox, MultilineTextBox)) and (w.active or getattr(w, '_dragging', False)):
+                        if isinstance(w, MultilineTextBox):
+                            w.handle_event(event, False, lambda: None, font=font_small)
+                        else:
+                            w.handle_event(event, font=font_small)
+                for w in (gen_steps_box, gen_temp_box, gen_topk_box,
+                          conv_gguf_box, conv_out_box, conv_dm_box, conv_nl_box,
+                          conv_nh_box, conv_ks_box):
+                    if w.active or getattr(w, "_dragging", False):
+                        w.handle_event(event, font=font_label if w in (gen_steps_box, gen_temp_box, gen_topk_box)
+                                       else font_small)
                 prompt_box.handle_event(event, True, do_send, font=font)
                 chat.handle_scrollbar_event(event)
                 nc = scroll_thumb.handle_event(event, SETTINGS_CONTENT_H, SETTINGS_VIEWPORT_H)
@@ -6555,6 +7537,14 @@ def gui_main():
                     prompt_box.handle_event(event, True, do_send, font=font)
                     for box in (gen_steps_box, gen_temp_box, gen_topk_box):
                         box.handle_event(event, font=font_label)
+
+        if (pending_model_action[0] is not None
+                and (train_thread[0] is None or not train_thread[0].is_alive())):
+            action, pending_model_action[0] = pending_model_action[0], None
+            action()
+        if state["error"] and state["error_seq"] != last_chat_error_seq[0]:
+            chat.add("error", f"ERROR: {state['error']}")
+            last_chat_error_seq[0] = state["error_seq"]
 
         frame_i[0] += 1
         if frame_i[0] % 6 == 0:       # PERF: widget sweep at 10 Hz is plenty;
@@ -6588,7 +7578,8 @@ def gui_main():
         screen.blit(gui_main._background, (0, 0))
         # compute frame dt in seconds for smooth physics
         dt = max(1/120.0, clock.get_time() / 1000.0)
-        orb_field.draw(screen, (W, H), time.time(), dt=dt)
+        if cfg.gui_balls_enabled:
+            orb_field.draw(screen, (W, H), time.time(), dt=dt)
         screen.blit(gui_main._panel_bg, (0, 0))
         # Smooth outer border around whole UI
         try:
@@ -6608,11 +7599,12 @@ def gui_main():
               "stopping": COLORS["warn"], "done": COLORS["good"], "error": COLORS["danger"]}.get(state["status"], COLORS["muted"])
         ls = f"{state['loss']:.4f}" if state["loss"] is not None else "--"
         eta_str = format_eta_human(state["eta_sec"]) if state["status"] in ("training", "paused") else "--"
-        spb_str = f"{state['sec_per_batch']:.2f}s/batch" if state.get("sec_per_batch") else ""
+        spb = state.get("sec_per_batch")
+        tps_str = f"{cfg.batch_size * cfg.seq_len / max(spb, 1e-9):.0f} tok/s" if spb else ""
         line1 = font_small.render(f"status: {state['status']}   dtype:{cfg.train_dtype}   loss_fn:{cfg.loss_fn}", True, sc)
         line2 = font_small.render(
             f"epoch {state['epoch']}/{state['epochs']}  batch {state['batch']}/{state['n_batches']}  "
-            f"loss {ls}  ETA {eta_str}  {spb_str}", True, COLORS["text"])
+            f"loss {ls}  ETA {eta_str}  {tps_str}", True, COLORS["text"])
         hp = state.get("hparams") or {}
         if hp:
             hp_bits = [f"mode={hp.get('model_mode','?')}", f"d={hp.get('d_model','?')}", f"L={hp.get('n_layers','?')}",
@@ -6691,10 +7683,10 @@ def gui_main():
                 continue
             gy = field_y[visible[0]] - 22 + y_off
             heading = font_small.render(str(group_name).upper(), True, COLORS["pink"])
-            screen.blit(heading, (SETTINGS_X, gy + 16))
+            screen.blit(heading, (SETTINGS_X, gy + 6))
             pygame.draw.aaline(screen, (190, 105, 255, 95),
-                               (SETTINGS_X + heading.get_width() + 10, gy + 24),
-                               (LEFT_W - 42, gy + 24))
+                               (SETTINGS_X + heading.get_width() + 10, gy + 14),
+                               (LEFT_W - 42, gy + 14))
             for k in visible:
                 w = settings_fields[k]
                 base_y = field_y[k] + y_off
@@ -6736,7 +7728,7 @@ def gui_main():
         gguf_btn.draw(screen, font_small, gguf_btn.rect.collidepoint(mouse_pos), COLORS)
 
         # ---- right side: generation + chat ----
-        screen.blit(font_bold.render("GENERATION", True, COLORS["pink"]), (RIGHT_X, GEN_ROW_Y - 20))
+        # screen.blit(font_bold.render("GENERATION", True, COLORS["pink"]), (RIGHT_X, GEN_ROW_Y - 20))
         for box in (gen_steps_box, gen_temp_box, gen_topk_box):
             box.draw(screen, font_label, COLORS)
         meta_gen_cb.draw(screen, font_small, COLORS)
@@ -6748,10 +7740,6 @@ def gui_main():
         copy_chat_btn.draw(screen, font_small, copy_chat_btn.rect.collidepoint(mouse_pos), COLORS)
         unload_btn.draw(screen, font_small, unload_btn.rect.collidepoint(mouse_pos), COLORS)
         console.draw(screen, font_console, COLORS)   # item 18
-
-        if state["error"]:
-            err_surf = font_small.render(f"ERROR: {state['error']}", True, COLORS["danger"])
-            screen.blit(err_surf, (16, H - 18))
 
         if state["convert_open"]:
             ov = pygame.Rect(W // 2 - 380, 140, 760, 320)
@@ -6784,7 +7772,7 @@ def gui_main():
 
         pygame.display.flip()
         # PERF: maintain a minimum 60 FPS UI refresh rate as requested.
-        clock.tick(60)
+        clock.tick(cfg.gui_fps)
 
     api_server.stop()
     monitor._stop = True
@@ -6829,9 +7817,9 @@ def _build_chat_context(cfg: Config, history: List[dict], prompt: str) -> str:
             if t["role"] == "user":
                 parts.append(f"{cfg.user_name}: {t['text']}")
             elif t["role"] == "model":
-                parts.append(f"{cfg.assistant_name}: {t['text']}")
+                parts.append(f"{cfg.speaker_identity or cfg.assistant_name}: {t['text']}")
     parts.append(f"{cfg.user_name}: {prompt}")
-    parts.append(f"{cfg.assistant_name}:")
+    parts.append(f"{cfg.speaker_identity or cfg.assistant_name}:")
     return "\n".join(parts)
 
 
@@ -6844,8 +7832,8 @@ def _continue_seed(cfg: Config, history: List[dict]) -> str:
         if t["role"] == "user":
             parts.append(f"{cfg.user_name}: {t['text']}")
         elif t["role"] == "model":
-            parts.append(f"{cfg.assistant_name}: {t['text']}")
-    return "\n".join(parts) if parts else f"{cfg.assistant_name}:"
+            parts.append(f"{cfg.speaker_identity or cfg.assistant_name}: {t['text']}")
+    return "\n".join(parts) if parts else f"{cfg.speaker_identity or cfg.assistant_name}:"
 
 
 def _run_generation_console(trainer: Trainer, cfg: Config, full_prompt: str) -> Optional[str]:
@@ -6929,6 +7917,7 @@ class ConsoleApp:
         self.trainer = Trainer(cfg, log_fn=self._log, progress_fn=self._progress)
         self.api_server = OpenAIAPIServer(self.trainer, cfg)
         self.train_thread: Optional[threading.Thread] = None
+        self.pending_model_action = None
         self.history: List[dict] = []
         self.running = True
 
@@ -6942,8 +7931,10 @@ class ConsoleApp:
         if batch >= n_batches or now - self._prog["t"] >= 1.5:
             self._prog["t"] = now
             nl = "\n" if batch >= n_batches else ""
+            tps = (self.cfg.batch_size * self.cfg.seq_len / max(sec_per_batch, 1e-9)
+                 if sec_per_batch else 0.0)
             print(f"\r[train] epoch {epoch}/{epochs} batch {batch}/{n_batches} "
-                  f"loss {loss:.4f} ETA {format_eta_human(eta_sec)}     {nl}",
+                f"loss {loss:.4f} ETA {format_eta_human(eta_sec)} {tps:.0f} tok/s     {nl}",
                   end="", flush=True)
 
     def is_busy(self) -> bool:
@@ -6965,6 +7956,16 @@ class ConsoleApp:
             except Exception as e:
                 self.state["status"] = "error"
                 self._log(f"error: {e}")
+            finally:
+                pending, self.pending_model_action = self.pending_model_action, None
+                if pending is not None:
+                    try:
+                        self.state["status"] = "loading"
+                        pending()
+                        self.state["status"] = "idle"
+                    except Exception as e:
+                        self.state["status"] = "error"
+                        self._log(f"queued model action failed: {e}")
         self.train_thread = threading.Thread(target=run, daemon=True)
         self.train_thread.start()
         return True
@@ -7037,16 +8038,14 @@ class ConsoleApp:
         if not ck:
             print("[load] no checkpoint found")
             return
-        if self.is_busy():
-            print("[load] stopping current run first ...")
-            self.trainer.stop()
-            if self.train_thread is not None:
-                self.train_thread.join(timeout=4.0)
-            self.state["status"] = "idle"
-
         def work():
             self.trainer.load_checkpoint(ck)
             self.state["loaded_ckpt_path"] = ck
+
+        if self.is_busy():
+            self.pending_model_action = work
+            print("[load] queued until training finishes; training continues uninterrupted")
+            return
         self._run_bg(work, busy_status="loading")
 
     def cmd_save(self):
@@ -7058,14 +8057,19 @@ class ConsoleApp:
             self.trainer.loss_history[-1] if self.trainer.loss_history else float("nan"))
 
     def cmd_unload(self):
+        def unload():
+            with self.trainer.gen_lock:
+                self.trainer._free_model()
+            self.state["loaded_ckpt_path"] = ""
+
         if self.is_busy():
-            print("[unload] training in progress -- stop it first")
+            self.pending_model_action = unload
+            print("[unload] queued until training finishes; training continues uninterrupted")
             return
         if self.trainer.model is None:
             print("[unload] no model loaded")
             return
-        self.trainer._free_model()
-        self.state["loaded_ckpt_path"] = ""
+        unload()
         print("[unload] model unloaded; VRAM/RAM released")
 
     def cmd_membase(self):
@@ -7553,3 +8557,4 @@ if __name__ == "__main__":
     except ImportError as e:
         print(f"[FATAL] missing dependency: {e}")
         sys.exit(1)
+ 
